@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+logs/
+dbt/target/
+dbt/logs/
+.DS_Store
+.env.*
+!.env.example
+docs/raw_bytes_lab_state.json

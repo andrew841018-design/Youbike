@@ -1,0 +1,4 @@
+CREATE TABLE raw_bytes (
+    id SERIAL PRIMARY KEY,
+    data BYTEA NOT NULL
+)
