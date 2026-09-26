@@ -8,5 +8,10 @@ dbt/target/
 dbt/logs/
 .DS_Store
 .env.*
-!.env.example
 docs/raw_bytes_lab_state.json
+
+# Markdown stays local except these three project documents
+*.[mM][dD]
+!/README.md
+!/重點整理.md
+!/docs/engineering_challenges_log.md
