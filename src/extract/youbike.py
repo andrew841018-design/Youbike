@@ -9,15 +9,49 @@ import uuid
 from json import loads
 
 load_dotenv("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
-def check_json(row,type,col):
+
+def check_json(row,type_,col):
+    allowed_types = (int, float) if type_ is float else (type_,)
+    if type(row[col]) not in allowed_types:
+        raise ValueError(f"{col} must be {allowed_types}")
     if col not in row:
         raise ValueError(f"Missing column: {col}")
-    if not isinstance(row[col],type):
-        raise ValueError(f"{col} must be {type}")
-    if type == str:
+    if type_==int and row[col]<0:
+        raise ValueError(f"{col} cannot be negative")
+# isinstance(row[col],bool) 可以把row[col]=true/false抓出來，所以就可以過濾type=int,row[col]=true這種測資
+    if isinstance(row[col],bool) and type_ == int:
+        raise ValueError(f"{row[col]} cannot be boolean")
+    if type_ == str:
         if not row[col].strip():
             raise ValueError(f"{col} cannot be empty")
-
+def parse_station(row):
+    check_json(row,str,"sno")
+    check_json(row,str,"sna")
+    check_json(row,str,"sarea")
+    check_json(row,float,"latitude")
+    check_json(row,float,"longitude")
+    check_json(row,int,"Quantity")
+    check_json(row,int,"available_rent_bikes")
+    check_json(row,int,"available_return_bikes")
+    check_json(row,str,"act")
+    check_json(row,str,"srcUpdateTime")
+    station_id = row["sno"]
+    station_name = row["sna"]
+    station_area = row["sarea"]
+    latitude = row["latitude"]
+    longitude = row["longitude"]
+    quantity = row["Quantity"]
+    available_rent_bikes = row["available_rent_bikes"]
+    available_rent_bikes = row["available_rent_bikes"]
+    available_return_bikes = row["available_return_bikes"]
+    station_active = row["act"]
+    """"deal with timezone"""
+    time=row["srcUpdateTime"]
+    parsed=DateTime.strptime(time,"%Y-%m-%d %H:%M:%S")
+    taipei_time=parsed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    utc_time=taipei_time.astimezone(timezone.utc)
+    source_update_time = utc_time
+    return station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time
 def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json"):
     request_time= DateTime.now(timezone.utc)
     start_time = monotonic()
@@ -47,32 +81,7 @@ def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v
         for row in json:
             if not isinstance(row,dict):
                 raise ValueError("Response is not a dictionary/json")#json is api format=dict in python
-            check_json(row,str,"sno")
-            check_json(row,str,"sna")
-            check_json(row,str,"sarea")
-            check_json(row,float,"latitude")
-            check_json(row,float,"longitude")
-            check_json(row,int,"Quantity")
-            check_json(row,int,"available_rent_bikes")
-            check_json(row,int,"available_return_bikes")
-            check_json(row,str,"act")
-            check_json(row,str,"srcUpdateTime")
-            station_id = row["sno"]
-            station_name = row["sna"]
-            station_area = row["sarea"]
-            latitude = row["latitude"]
-            longitude = row["longitude"]
-            quantity = row["Quantity"]
-            available_rent_bikes = row["available_rent_bikes"]
-            available_rent_bikes = row["available_rent_bikes"]
-            available_return_bikes = row["available_return_bikes"]
-            station_active = row["act"]
-            """"deal with timezone"""
-            time=row["srcUpdateTime"]
-            parsed=DateTime.strptime(time,"%Y-%m-%d %H:%M:%S")
-            taipei_time=parsed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
-            utc_time=taipei_time.astimezone(timezone.utc)
-            source_update_time = utc_time
+            station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time = parse_station(row)
             with conn.cursor() as cursor:
                 cursor.execute(
                 """

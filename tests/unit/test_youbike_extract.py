@@ -1,10 +1,10 @@
 import os
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
-from dotenv import dotenv_values
-from src.extract.youbike import extract_youbike
+from dotenv import dotenv_values 
+from src.extract.youbike import extract_youbike,check_json
 import socket
-import pytest
+import pytest 
 import requests
 from unittest.mock import MagicMock
 
@@ -96,3 +96,15 @@ def test_stream_time_budget(failure_test_env, http_200_response, monkeypatch):
     monkeypatch.setattr("src.extract.youbike.monotonic", MagicMock(side_effect=[0, 31]))
     with pytest.raises(TimeoutError, match=r"^Time limit exceeded$"):
         extract_youbike()
+
+@pytest.mark.parametrize("row,type,col",
+    [
+        ({"Quantity": 0},int,"Quantity"),
+        ({"Quantity": 10},int,"Quantity"),
+        ({"Quantity": -1},int,"Quantity"),
+        ({"Quantity": True},int,"Quantity"),
+        ({"Quantity": 1.5},int,"Quantity")
+    ]
+)
+def test_check_json(row,type,col):
+    check_json(row,type,col)
