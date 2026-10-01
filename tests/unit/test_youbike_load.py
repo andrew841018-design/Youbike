@@ -17,8 +17,6 @@ def test_load_replay_and_reconcile(monkeypatch):
         rows_before = conn.execute("SELECT * FROM response WHERE batch_id = %s ORDER BY station_id", (batch_id,)).fetchall()
         load_youbike(batch_id)
         rows_after = conn.execute("SELECT * FROM response WHERE batch_id = %s ORDER BY station_id", (batch_id,)).fetchall()
-        if rows_after != rows_before:
-            raise Exception(f"reconcile_youbike failed at batch_id{batch_id}")
         assert rows_after == rows_before
         assert len(rows_after) == 2
         batch_id = "b3056c50-9471-4349-9a3c-32859e981058"
@@ -26,7 +24,5 @@ def test_load_replay_and_reconcile(monkeypatch):
         rows_before = conn.execute("SELECT * FROM response WHERE batch_id = %s ORDER BY station_id", (batch_id,)).fetchall()
         load_youbike(batch_id)
         rows_after = conn.execute("SELECT * FROM response WHERE batch_id = %s ORDER BY station_id", (batch_id,)).fetchall()
-        if rows_after != rows_before:
-            raise Exception(f"reconcile_youbike failed at batch_id{batch_id}")
         assert rows_after == rows_before
         assert len(rows_after) == 2

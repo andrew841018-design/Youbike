@@ -1,6 +1,6 @@
 import os
 import psycopg
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.conninfo import make_conninfo
 from dotenv import dotenv_values 
 from src.extract.youbike import extract_youbike,check_json
 import socket
@@ -97,14 +97,18 @@ def test_stream_time_budget(failure_test_env, http_200_response, monkeypatch):
     with pytest.raises(TimeoutError, match=r"^Time limit exceeded$"):
         extract_youbike()
 
-@pytest.mark.parametrize("row,type,col",
+@pytest.mark.parametrize("row,type,col,should_raise",
     [
-        ({"Quantity": 0},int,"Quantity"),
-        ({"Quantity": 10},int,"Quantity"),
-        ({"Quantity": -1},int,"Quantity"),
-        ({"Quantity": True},int,"Quantity"),
-        ({"Quantity": 1.5},int,"Quantity")
+        ({"Quantity": 0},int,"Quantity",False),
+        ({"Quantity": 10},int,"Quantity",False),
+        ({"Quantity": -1},int,"Quantity",True),
+        ({"Quantity": True},int,"Quantity",True),
+        ({"Quantity": 1.5},int,"Quantity",True)
     ]
 )
-def test_check_json(row,type,col):
-    check_json(row,type,col)
+def test_check_json(row,type,col,should_raise):
+    if should_raise:
+        with pytest.raises(ValueError):
+            check_json(row,type,col)
+    else:
+        check_json(row,type,col)

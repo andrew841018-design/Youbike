@@ -46,7 +46,6 @@ def test_schema(test_env):
             taipei_tz=zoneinfo.ZoneInfo("Asia/Taipei")
             source_update_time=datetime.now(taipei_tz).astimezone(zoneinfo.ZoneInfo("UTC"))
             test_env.execute("INSERT INTO response (batch_id,quantity,station_id,station_name,station_area,latitude,longitude,available_rent_bikes,available_return_bikes,station_active,source_update_time,fetched_start_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (batch_id,5,station_id,"station_name","station_area",0.0,0.0,0,0,"0",source_update_time,fetched_start_at))
-            test_env.execute("INSERT INTO response (batch_id,quantity,station_id,station_name,station_area,latitude,longitude,available_rent_bikes,available_return_bikes,station_active,source_update_time,fetched_start_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (batch_id,5,station_id,"station_name","station_area",0.0,0.0,0,0,"0",source_update_time,fetched_start_at))
     batch_id_1 =str(uuid.uuid4())
     taipei_tz=zoneinfo.ZoneInfo("Asia/Taipei")
     fetched_start_at_1=datetime.now(taipei_tz).astimezone(zoneinfo.ZoneInfo("UTC"))
@@ -58,18 +57,7 @@ def test_schema(test_env):
     test_env.execute("INSERT INTO raw_bytes (batch_id,body,fetched_start_at) VALUES (%s,%s,%s)",(batch_id_2,b"[]",fetched_start_at_2))
     with pytest.raises(ForeignKeyViolation):
         with test_env.transaction():
-            test_env.execute("INSERT INTO response (batch_id,quantity,station_id,station_name," \
-            "station_area,latitude,longitude,available_rent_bikes,available_return_bikes,station_active," \
-            "source_update_time,fetched_start_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (batch_id_1,5,station_id,"station_name","station_area",0.0,0.0,0,0,"0",source_update_time,
-             fetched_start_at_1))
-            
-            test_env.execute("INSERT INTO response (batch_id,quantity,station_id,station_name," \
-            "station_area,latitude,longitude,available_rent_bikes,available_return_bikes,station_active," \
-            "source_update_time,fetched_start_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (batch_id_2,5,station_id,"station_name","station_area",0.0,0.0,0,0,"0",source_update_time,
-                fetched_start_at_2))
-            # error insertion
+            # Parent raw rows already exist; only the mismatched pair is needed.
             test_env.execute(
                 "INSERT INTO response (batch_id,quantity,station_id,station_name,station_area,latitude,longitude,available_rent_bikes,available_return_bikes,station_active,source_update_time,fetched_start_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (batch_id_1,5,str(uuid.uuid4()),"station_name","station_area",0.0,0.0,0,0,"0",source_update_time,fetched_start_at_2),
