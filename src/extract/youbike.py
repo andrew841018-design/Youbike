@@ -52,8 +52,47 @@ def parse_station(row):
     utc_time=taipei_time.astimezone(timezone.utc)
     source_update_time = utc_time
     return station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time
+def load_youbike(batch_id):
+    database_url = os.environ["YOUBIKE_DATABASE_URL"]
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cursor:
+            row  = cursor.execute("SELECT body,batch_id,fetched_start_at FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"Batch ID {batch_id} not found")
+            body,batch_id,fetch_start_at = row
+            json=loads(body)
+            if json==[] or json=={} or isinstance(json,list)==False:
+                raise ValueError("Response is empty")
+            record = cursor.execute("SELECT batch_id,station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time FROM response WHERE fetched_start_at = %s", (fetch_start_at,)).fetchall()
+            existing = {row[1]: row for row in record} # {"station_id":(batch_id,station_id,station_name....)}
+        for row in json:
+            if not isinstance(row,dict):
+                raise ValueError("Response is not a dictionary/json")#json is api format=dict in python
+            parsed = parse_station(row)
+            if row["sno"] in existing:
+                db_row = existing[row["sno"]]  # DB 查回的整列，第一項是 batch_id
+                db_values = db_row[1:]  # 去掉 batch_id，剩下的十欄與 parsed 順序相同
+                if db_values != parsed:
+                    raise ValueError("DB and parsed data not match")
+                if db_row[0] != batch_id:
+                    raise ValueError("DB and raw batch_id not match")
+                continue  # 內容與 batch 都相同，跳過下方 INSERT
+
+            with conn.cursor() as cursor:
+                cursor.execute(
+                """
+                INSERT INTO response
+                (batch_id,station_id,station_name,station_area,latitude,
+                longitude,quantity,available_rent_bikes,
+                available_return_bikes,station_active,source_update_time,fetched_start_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (batch_id,parsed[0],parsed[1],parsed[2],parsed[3],parsed[4],parsed[5],parsed[6],parsed[7],parsed[8],parsed[9],fetch_start_at))
+
+
+
+
 def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json"):
-    request_time= DateTime.now(timezone.utc)
+    request_time = DateTime.now(timezone.utc)
     start_time = monotonic()
     budget_second = 30
     batch_id = str(uuid.uuid4())
@@ -73,23 +112,4 @@ def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v
     with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"]) as conn:
         with conn.cursor() as cursor:
             cursor.execute("INSERT INTO raw_bytes (body,fetched_start_at,batch_id) VALUES (%s,%s,%s)", (body,request_time,batch_id))
-            
-    with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"]) as conn:
-        json=loads(body)
-        if json==[] or json=={} or isinstance(json,list)==False:
-            raise ValueError("Response is empty")
-        for row in json:
-            if not isinstance(row,dict):
-                raise ValueError("Response is not a dictionary/json")#json is api format=dict in python
-            station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time = parse_station(row)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                """
-                INSERT INTO response
-                (batch_id,station_id,station_name,station_area,latitude,
-                longitude,quantity,available_rent_bikes,
-                available_return_bikes,station_active,source_update_time,fetched_start_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (batch_id,station_id,station_name,station_area,
-                latitude,longitude,quantity,available_rent_bikes,
-                available_return_bikes,station_active,source_update_time,request_time))
+    load_youbike(batch_id)
