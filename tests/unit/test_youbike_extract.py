@@ -1,12 +1,13 @@
-import os
-import psycopg
+import os,uuid,random,pytest,psycopg,socket,requests
+from datetime import datetime,timezone
 from psycopg.conninfo import make_conninfo
 from dotenv import dotenv_values 
 from src.extract.youbike import extract_youbike,check_json
-import socket
-import pytest 
-import requests
 from unittest.mock import MagicMock
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
+from psycopg.errors import UniqueViolation
+
 
 def test_extract_raw_body(monkeypatch):
     config=dotenv_values("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
@@ -43,14 +44,6 @@ def test_db_failure(monkeypatch):
     message = str(errinfo.value)
     assert "Connection refused" in message
     assert str(unused_port) in message
-def test_http_404(monkeypatch):
-    config=dotenv_values("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
-    test_dsn=config["YOUBIKE_TEST_DATABASE_URL"]
-    if not test_dsn:
-        raise RuntimeError("YOUBIKE_TEST_DATABASE_URL not found in .env")
-    monkeypatch.setenv("YOUBIKE_DATABASE_URL",test_dsn)
-    with pytest.raises(Exception, match=r"^Request failed with status code: 404$"):
-        extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate_missing.json")
 
 
 @pytest.fixture
@@ -112,3 +105,27 @@ def test_check_json(row,type,col,should_raise):
             check_json(row,type,col)
     else:
         check_json(row,type,col)
+@pytest.fixture
+def local_server(failure_test_env):
+    class handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(503)
+            self.end_headers()
+    with HTTPServer(("127.0.0.1", 0), handler) as server:
+        thread = Thread(target=server.serve_forever,daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/"
+        finally:
+            server.shutdown()
+            thread.join()
+def test_web_scrapping_503_error(local_server):
+    with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"]) as conn:
+        raw_bytes_count_before=conn.execute("SELECT COUNT(*) FROM raw_bytes").fetchone()[0]
+        response_count_before=conn.execute("SELECT COUNT(*) FROM response").fetchone()[0]
+        with pytest.raises(Exception, match=r"^Request failed with status code: 503$"):
+            extract_youbike(url=local_server)
+        raw_bytes_count_after=conn.execute("SELECT COUNT(*) FROM raw_bytes").fetchone()[0]
+        response_count_after=conn.execute("SELECT COUNT(*) FROM response").fetchone()[0]
+        assert raw_bytes_count_after==raw_bytes_count_before
+        assert response_count_after==response_count_before
