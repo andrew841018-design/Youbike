@@ -1,5 +1,7 @@
 .env
 .venv/
+.venv-airflow/
+.airflow/
 __pycache__/
 .pytest_cache/
 data/
