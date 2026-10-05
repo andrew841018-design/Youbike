@@ -7,6 +7,7 @@ from datetime import datetime as DateTime,timezone
 from dotenv import load_dotenv
 import uuid
 from json import loads
+import argparse
 
 load_dotenv("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
 
@@ -91,8 +92,11 @@ def load_youbike(batch_id):
 
 
 
-def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json"):
-    request_time = DateTime.now(timezone.utc)
+def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json",scrape_time=None):
+    if scrape_time is None:
+        request_time = DateTime.now(timezone.utc)
+    else:
+        request_time = scrape_time
     start_time = monotonic()
     budget_second = 30
     batch_id = str(uuid.uuid4())
@@ -113,3 +117,8 @@ def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v
         with conn.cursor() as cursor:
             cursor.execute("INSERT INTO raw_bytes (body,fetched_start_at,batch_id) VALUES (%s,%s,%s)", (body,request_time,batch_id))
     load_youbike(batch_id)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scrape_time", type=DateTime.fromisoformat)
+    args = parser.parse_args()
+    extract_youbike(scrape_time=args.scrape_time)
