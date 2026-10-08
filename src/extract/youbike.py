@@ -7,6 +7,7 @@ from datetime import datetime as DateTime,timezone
 from dotenv import load_dotenv
 import uuid
 from json import loads
+
 import argparse
 
 load_dotenv("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
@@ -97,14 +98,14 @@ def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v
         request_time = DateTime.now(timezone.utc)
     else:
         request_time = scrape_time
-    start_time = monotonic()
-    budget_second = 30
     batch_id = str(uuid.uuid4())
-    buffer = bytearray()
+    budget_second = 30
     size_limit = 5*1024*1024
+    start_time = monotonic()
+    buffer = bytearray()
     with requests.get(url,stream=True,timeout=(5,10)) as response:#5秒連線逾時，10秒下載逾時
         if response.status_code != 200:
-            raise Exception(f"Request failed with status code: {response.status_code}")
+            raise requests.HTTPError(f"Request failed with status code: {response.status_code}", response=response)
         for chunk in response.iter_content(chunk_size=1024*64):
             if len(buffer)+len(chunk)>size_limit:
                 raise ValueError("Response size limit exceeded")
