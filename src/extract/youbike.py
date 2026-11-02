@@ -3,15 +3,17 @@ import psycopg
 import os
 from time import monotonic
 from zoneinfo import ZoneInfo
-from datetime import datetime as DateTime,timezone
+from datetime import datetime as DateTime,timezone,timedelta
 from dotenv import load_dotenv
+from src.source_id import Source
+import logging
 import uuid
 from json import loads
 
 import argparse
 
 load_dotenv("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
-
+load_count=[]
 def check_json(row,type_,col):
     allowed_types = (int, float) if type_ is float else (type_,)
     if type(row[col]) not in allowed_types:
@@ -56,6 +58,8 @@ def parse_station(row):
     return station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time
 def load_youbike(batch_id):
     database_url = os.environ["YOUBIKE_DATABASE_URL"]
+    global load_count
+    load_count.append(batch_id)
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cursor:
             row  = cursor.execute("SELECT body,batch_id,fetched_start_at FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
@@ -96,28 +100,69 @@ def load_youbike(batch_id):
 def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json",scrape_time=None):
     if scrape_time is None:
         request_time = DateTime.now(timezone.utc)
+        ### 30 min align ###
+        request_time = request_time.replace(
+            minute=(request_time.minute // 30) * 30, second=0, microsecond=0
+        )
     else:
-        request_time = scrape_time
+        if isinstance(scrape_time, str):
+            scrape_time = DateTime.fromisoformat(scrape_time.replace("Z", "+00:00"))
+        if scrape_time.utcoffset() is None:
+            raise ValueError("scrape_time must include timezone information")
+        request_time = scrape_time.astimezone(timezone.utc)
+    ## normalize reuquest time
+    event_time = DateTime(
+    request_time.year, request_time.month, request_time.day, request_time.hour, request_time.minute,
+    tzinfo=timezone.utc
+    )
+    seconds = event_time.timestamp()
+    half_hour_slot_id = int(seconds // 60 // 30) ## unit: 30 min
+    slot_key = (Source.YOUBIKE.value, half_hour_slot_id)
     batch_id = str(uuid.uuid4())
     budget_second = 30
     size_limit = 5*1024*1024
     start_time = monotonic()
     buffer = bytearray()
-    with requests.get(url,stream=True,timeout=(5,10)) as response:#5秒連線逾時，10秒下載逾時
-        if response.status_code != 200:
-            raise requests.HTTPError(f"Request failed with status code: {response.status_code}", response=response)
-        for chunk in response.iter_content(chunk_size=1024*64):
-            if len(buffer)+len(chunk)>size_limit:
-                raise ValueError("Response size limit exceeded")
-            if monotonic()-start_time>=budget_second:
-                raise TimeoutError("Time limit exceeded")
-            buffer.extend(chunk)
-        body = bytes(buffer)
     assert os.environ.get("YOUBIKE_DATABASE_URL")
-    with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"]) as conn:
+    with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", slot_key)
+            if cursor.fetchone()[0] == False:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Another process is already running for slot {slot_key}. Exiting.")
+                return
+            raw_row = cursor.execute("SELECT batch_id FROM raw_bytes WHERE fetched_start_at = %s", (request_time,)).fetchone()
+            if raw_row is not None:
+                load_youbike(raw_row[0])# replay
+                release_lock = cursor.execute("SELECT pg_advisory_unlock(%s, %s)", slot_key).fetchone()[0]
+                if release_lock == False:
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Failed to release advisory lock for slot {slot_key}.")
+                return
+            # expired and nothing in raw_bytes
+            expire_at = request_time + timedelta(minutes=30)
+            if DateTime.now(timezone.utc) >= expire_at:
+                logger = logging.getLogger(__name__)
+                logger.warning("missing: no raw for slot %s (expired at %s). Exiting.", request_time, expire_at)
+                return
+        with requests.get(url,stream=True,timeout=(5,10)) as response:#5秒連線逾時，10秒下載逾時
+            if response.status_code != 200:
+                raise requests.HTTPError(f"Request failed with status code: {response.status_code}", response=response)
+            for chunk in response.iter_content(chunk_size=1024*64):
+                if len(buffer)+len(chunk)>size_limit:
+                    raise ValueError("Response size limit exceeded")
+                if monotonic()-start_time>=budget_second:
+                    raise TimeoutError("Time limit exceeded")
+                buffer.extend(chunk)
+            body = bytes(buffer)
         with conn.cursor() as cursor:
             cursor.execute("INSERT INTO raw_bytes (body,fetched_start_at,batch_id) VALUES (%s,%s,%s)", (body,request_time,batch_id))
-    load_youbike(batch_id)
+            load_youbike(batch_id)
+            release_lock = cursor.execute("SELECT pg_advisory_unlock(%s, %s)", slot_key).fetchone()[0]
+            if release_lock == False:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to release advisory lock for slot {slot_key}.")
+                return
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scrape_time", type=DateTime.fromisoformat)
