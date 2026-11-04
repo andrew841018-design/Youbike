@@ -8,7 +8,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from psycopg.errors import UniqueViolation
 
-
 def test_extract_raw_body(monkeypatch):
     config=dotenv_values("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
     test_dsn=config["YOUBIKE_TEST_DATABASE_URL"]
@@ -20,7 +19,8 @@ def test_extract_raw_body(monkeypatch):
         if database != "youbike_test":
             raise RuntimeError("Database name is not youbike_test")
         before = conn.execute("SELECT count(DISTINCT batch_id) FROM raw_bytes").fetchone()[0]
-        extract_youbike()
+        slot = conn.execute("SELECT MAX(fetched_start_at)+ INTERVAL '60 minutes' FROM raw_bytes").fetchone()[0]
+        extract_youbike(scrape_time=slot)
         after = conn.execute("SELECT count(DISTINCT batch_id) FROM raw_bytes").fetchone()[0]
         assert after == before + 1
 def test_db_failure(monkeypatch):

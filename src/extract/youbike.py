@@ -57,6 +57,8 @@ def parse_station(row):
     source_update_time = utc_time
     return station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time
 def load_youbike(batch_id):
+    inserted_count = 0
+    skipped_count = 0
     database_url = os.environ["YOUBIKE_DATABASE_URL"]
     global load_count
     load_count.append(batch_id)
@@ -82,7 +84,9 @@ def load_youbike(batch_id):
                     raise ValueError("DB and parsed data not match")
                 if db_row[0] != batch_id:
                     raise ValueError("DB and raw batch_id not match")
+                skipped_count += 1
                 continue  # 內容與 batch 都相同，跳過下方 INSERT
+            inserted_count += 1
 
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -93,11 +97,12 @@ def load_youbike(batch_id):
                 available_return_bikes,station_active,source_update_time,fetched_start_at)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (batch_id,parsed[0],parsed[1],parsed[2],parsed[3],parsed[4],parsed[5],parsed[6],parsed[7],parsed[8],parsed[9],fetch_start_at))
+    return inserted_count, skipped_count
 
 
-
-
-def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json",scrape_time=None):
+def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json",scrape_time="2099-01-01T00:00:00+08:00"):
+    inserted_count = 0
+    skipped_count = 0
     if scrape_time is None:
         request_time = DateTime.now(timezone.utc)
         ### 30 min align ###
@@ -123,46 +128,61 @@ def extract_youbike(url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v
     size_limit = 5*1024*1024
     start_time = monotonic()
     buffer = bytearray()
+    finish_sql_cmd = "UPDATE run_status SET status = %s, finished_at = now(), duration = now() - started_at,inserted_count = %s, skipped_count = %s, retry_count = %s WHERE run_id = %s"
+    fail_sql_cmd = "UPDATE run_status SET status = %s, finished_at = now(), duration = now() - started_at, error_code = %s, inserted_count = %s, skipped_count = %s, retry_count = %s WHERE run_id = %s"
     assert os.environ.get("YOUBIKE_DATABASE_URL")
     with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"], autocommit=True) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", slot_key)
-            if cursor.fetchone()[0] == False:
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Another process is already running for slot {slot_key}. Exiting.")
-                return
-            raw_row = cursor.execute("SELECT batch_id FROM raw_bytes WHERE fetched_start_at = %s", (request_time,)).fetchone()
-            if raw_row is not None:
-                load_youbike(raw_row[0])# replay
+        run_id = None
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", slot_key)
+                if cursor.fetchone()[0] == False:
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Another process is already running for slot {slot_key}. Exiting.")
+                    return
+                run_id = str(uuid.uuid4())
+                cursor.execute("INSERT INTO run_status (run_id, source, scheduled_at, status,retry_count) VALUES (%s, 'youbike', %s, 'running', %s)", (run_id, request_time, int(retry_count)))
+                raw_row = cursor.execute("SELECT batch_id FROM raw_bytes WHERE fetched_start_at = %s", (request_time,)).fetchone()
+                if raw_row is not None:
+                    inserted_count, skipped_count = load_youbike(raw_row[0])# replay
+                    cursor.execute(finish_sql_cmd, ("succeeded", inserted_count, skipped_count, int(retry_count), run_id))
+
+                    release_lock = cursor.execute("SELECT pg_advisory_unlock(%s, %s)", slot_key).fetchone()[0]
+                    if release_lock == False:
+                        logger = logging.getLogger(__name__)
+                        logger.warning(f"Failed to release advisory lock for slot {slot_key}.")
+                        raise RuntimeError(f"Failed to release advisory lock for slot {slot_key}")
+                    return
+                # expired and nothing in raw_bytes
+                expire_at = request_time + timedelta(minutes=30)
+                if DateTime.now(timezone.utc) >= expire_at:
+                    logger = logging.getLogger(__name__)
+                    logger.warning("missing: no raw for slot %s (expired at %s). Exiting.", request_time, expire_at)
+                    cursor.execute(finish_sql_cmd, ("missing", inserted_count, skipped_count, int(retry_count), run_id))
+                    return
+            with requests.get(url,stream=True,timeout=(5,10)) as response:#5秒連線逾時，10秒下載逾時
+                if response.status_code != 200:
+                    raise requests.HTTPError(f"Request failed with status code: {response.status_code}", response=response)
+                for chunk in response.iter_content(chunk_size=1024*64):
+                    if len(buffer)+len(chunk)>size_limit:
+                        raise ValueError("Response size limit exceeded")
+                    if monotonic()-start_time>=budget_second:
+                        raise TimeoutError("Time limit exceeded")
+                    buffer.extend(chunk)
+                body = bytes(buffer)
+            with conn.cursor() as cursor:
+                cursor.execute("INSERT INTO raw_bytes (body,fetched_start_at,batch_id) VALUES (%s,%s,%s)", (body,request_time,batch_id))
+                inserted_count, skipped_count = load_youbike(batch_id)
+                cursor.execute(finish_sql_cmd, ("succeeded", inserted_count, skipped_count, int(retry_count), run_id))
                 release_lock = cursor.execute("SELECT pg_advisory_unlock(%s, %s)", slot_key).fetchone()[0]
                 if release_lock == False:
                     logger = logging.getLogger(__name__)
                     logger.warning(f"Failed to release advisory lock for slot {slot_key}.")
-                return
-            # expired and nothing in raw_bytes
-            expire_at = request_time + timedelta(minutes=30)
-            if DateTime.now(timezone.utc) >= expire_at:
-                logger = logging.getLogger(__name__)
-                logger.warning("missing: no raw for slot %s (expired at %s). Exiting.", request_time, expire_at)
-                return
-        with requests.get(url,stream=True,timeout=(5,10)) as response:#5秒連線逾時，10秒下載逾時
-            if response.status_code != 200:
-                raise requests.HTTPError(f"Request failed with status code: {response.status_code}", response=response)
-            for chunk in response.iter_content(chunk_size=1024*64):
-                if len(buffer)+len(chunk)>size_limit:
-                    raise ValueError("Response size limit exceeded")
-                if monotonic()-start_time>=budget_second:
-                    raise TimeoutError("Time limit exceeded")
-                buffer.extend(chunk)
-            body = bytes(buffer)
-        with conn.cursor() as cursor:
-            cursor.execute("INSERT INTO raw_bytes (body,fetched_start_at,batch_id) VALUES (%s,%s,%s)", (body,request_time,batch_id))
-            load_youbike(batch_id)
-            release_lock = cursor.execute("SELECT pg_advisory_unlock(%s, %s)", slot_key).fetchone()[0]
-            if release_lock == False:
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Failed to release advisory lock for slot {slot_key}.")
-                return
+                    raise RuntimeError(f"Failed to release advisory lock for slot {slot_key}")
+        except Exception as error:
+            if run_id is not None:
+                conn.execute(fail_sql_cmd, ("failed", str(error), inserted_count, skipped_count, int(retry_count), run_id))
+            raise error
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scrape_time", type=DateTime.fromisoformat)

@@ -32,6 +32,7 @@ with DAG(
         task_id="scrape_youbike_realtime",
         python_callable=extract_youbike,  # Replace with actual scraping logic
         op_kwargs={
+            "retry_count":"{{ti.try_number-1}}",
             "scrape_time": "{{ data_interval_end }}",
         },
         retries=4,
