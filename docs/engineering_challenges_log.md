@@ -636,3 +636,405 @@ def test_expired_without_raw_is_missing(youbike_test_env,controlled_raw_http_ser
 一句話記法：讓產品看到「剛好到期」的那一刻——時間由測試凍結，名字換在產品模組上，類別寫在測試函式裡。
 
 核對依據：範例都在本機 Youbike/.venv（Python 3.9.6）獨立執行；專案結果依 2026-11-02 18:15 的存檔，第三個測試與 `>` 副本對照都在 youbike_test 實跑（副本對照會在該 slot 寫入一組測試資料）。第三個情境還差用 caplog 核對 missing 紀錄，正式情境仍 2/3；本筆記不增加 D11 驗收完成數。
+
+## 2026-11-04：retry_count 怎麼從 Airflow 傳進產品，為什麼要傳、為什麼加 int()
+
+問題：DAG 的 `"retry_count": "{{ ti.try_number - 1 }}"` 是什麼？重試不是看 Airflow 就好，為什麼要把變數抓進來？參數預設是 `retry_count=0`，為什麼還要寫 `int(retry_count)`？
+
+結論：**這一行請 Airflow 在每次執行前算出「這是第幾次重試」，當成參數交給 `extract_youbike`。** 傳進來不是為了控制重試，重試仍由 Airflow 決定；要傳是因為 D12-B 要求 `run_status` 自己記 `retry_count`。Airflow 傳來的是字串 `"0"`，不是 int；`int()` 不是必要的，但能把型別統一成數字。
+
+### 這一行怎麼拆
+
+| 片段 | 意思 |
+|---|---|
+| `op_kwargs` | Airflow 呼叫 `python_callable` 時要帶的具名參數 |
+| `"{{ ... }}"` | Jinja 模板；DAG 檔被讀取時只是字串，任務要跑時 Airflow 才算出裡面的值 |
+| `ti` | task instance，代表現在這次執行的任務；和 `data_interval_end` 一樣由 Airflow 提供，不用 import |
+| `ti.try_number` | 現在是第幾次嘗試，第一次是 1 |
+| `- 1` | `retry_count` 記的是重試幾次，第一次還沒重試，所以要是 0 |
+
+`retries=4` 代表最多跑 5 次，傳進去的值依序是 `"0"` 到 `"4"`。
+
+### 為什麼不是只看 Airflow
+
+只想知道有沒有重試，Airflow 的畫面和 log 就看得到。要傳進來有兩個原因：
+
+- **契約要求：** [dashboard](de_transition_daily_dashboard.html) 的 D12-B 要 `run_status` 記 `retry_count`。
+- **函式自己不知道：** `extract_youbike` 是普通 Python 函式，命令列和測試也直接呼叫它，所以數字要由外面傳進來。不傳的話欄位一直是預設值 0，真的重試過的那筆也顯示 0。
+
+這個欄位和 Airflow 確實重複：每次嘗試都會新增一筆 run，同一個 `scheduled_at` 有幾筆，大致就看得出跑了幾次。`retry_count` 多給的是兩件事：
+
+- **分得出重試和手動重跑：** 手動重跑也會多一筆，但它的 `retry_count` 是 0。
+- **查詢方便：** 用 SQL 查 `run_status` 就看得到，不用再去對 Airflow。
+
+決定（2026-11-04）：Andrew 選擇保留這個欄位。HTML 原本只要求「記 retry_count」；「DAG 用 `ti.try_number - 1` 傳進來」是助理補的做法，同日由 Andrew 確認採用。
+
+### 範例 1：模板算出來是字串
+
+```python
+from jinja2 import Template
+
+class FakeTI:
+    try_number = 3
+
+rendered = Template("{{ ti.try_number - 1 }}").render(ti=FakeTI())
+print(repr(rendered), type(rendered).__name__)
+print(int(rendered))
+```
+
+```text
+'2' str
+2
+```
+
+`FakeTI` 只是假裝成 Airflow 的 `ti`，讓範例不用開 Airflow 也能跑。算出來的 `'2'` 有引號，是字串；`int()` 才把它變成數字。這段不放進專案，Airflow 會自己處理模板。
+
+### 範例 2：沒傳 vs 有傳
+
+```python
+def save_order(log, retry_count=0):
+    log.append(retry_count)
+
+no_pass = []
+for try_number in [1, 2]:
+    save_order(no_pass)
+
+passed = []
+for try_number in [1, 2]:
+    save_order(passed, retry_count=try_number - 1)
+
+print('沒傳：', no_pass)
+print('有傳：', passed)
+```
+
+```text
+沒傳： [0, 0]
+有傳： [0, 1]
+```
+
+迴圈代表 Airflow，只有它知道第幾次；`save_order` 代表產品函式。第 2 次明明是重試，沒傳就記成 0。
+
+### 範例 3：字串也寫得進 integer 欄位
+
+在 `Youbike/` 底下執行，用暫存表，連線結束就消失：
+
+```python
+from dotenv import dotenv_values
+import psycopg
+
+dsn = dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
+with psycopg.connect(dsn, autocommit=True) as conn:
+    conn.execute("CREATE TEMP TABLE runs (retry_count integer NOT NULL DEFAULT 0)")
+    conn.execute("INSERT INTO runs (retry_count) VALUES (%s)", ("2",))
+    row = conn.execute("SELECT retry_count, pg_typeof(retry_count)::text FROM runs").fetchone()
+    print(row)
+```
+
+```text
+(2, 'integer')
+```
+
+傳進去的是字串 `"2"`，PostgreSQL 自己轉成了整數，所以不加 `int()` 也寫得進去。
+
+### 範例 4：字串在 Python 裡不能和數字比
+
+```python
+retry_count = "2"
+print(int(retry_count) > 0)
+try:
+    print(retry_count > 0)
+except TypeError as error:
+    print(error)
+```
+
+```text
+True
+'>' not supported between instances of 'str' and 'int'
+```
+
+這就是建議加 `int()` 的原因：同一個參數可能是 int 也可能是 str，先統一成數字，之後在 Python 裡比較或計算才不會出錯。
+
+### 對照本專案
+
+依 2026-11-04 16:09 的存檔。
+
+| 位置 | 寫法 |
+|---|---|
+| `src/extract/youbike.py` 的參數 | `retry_count=0` |
+| `src/extract/youbike.py` 寫 running 的 INSERT | 多寫 `retry_count` 欄位，值是 `int(retry_count)` |
+| `dags/youbike_realtime.py` 的 `op_kwargs` | `"retry_count":"{{ti.try_number-1}}"` |
+
+| 誰呼叫 | 傳進來的值 | 型別 |
+|---|---|---|
+| 命令列、測試（沒傳） | `0` | int |
+| Airflow | `"0"` | str |
+
+真實 Airflow 的 11/04 16:00 那次：
+
+| 看哪裡 | 值 |
+|---|---|
+| Airflow 算出的 `op_kwargs` | `{'retry_count': '0', 'scrape_time': '2026-11-04 08:00:00+00:00'}` |
+| Airflow 的 `try_number` | 1 |
+| 正式庫的 `run_status.retry_count` | 0 |
+
+`scrape_time` 走同一個模板機制，也是字串，所以產品才有 `isinstance(scrape_time, str)` 那段轉換。
+
+如果來源第一次回 503，依程式推演會是這樣（這個情況還沒真的發生過）：
+
+```text
+第一次：extract_youbike(scrape_time=這個 slot, retry_count="0")
+        丟出 HTTPError，run_status 新增一筆 failed，retry_count = 0
+
+重試：  extract_youbike(scrape_time=同一個 slot, retry_count="1")
+        這次成功，run_status 再新增一筆 succeeded，retry_count = 1
+```
+
+### 容易混淆的地方
+
+1. **`retry_count=0` 不代表傳進來的是 int：** 0 只是沒人傳值時的預設值。
+2. **傳值不是控制重試：** 要不要重試、等多久，還是 `retries` 和 `Retry_Policy` 決定。
+3. **`- 1` 不能拿掉：** `try_number` 從 1 開始，拿掉的話第一次執行就記成重試 1 次。
+4. **不用在專案裡 import jinja2：** Airflow 自己處理模板，範例 1 只是示範。`{{ti.try_number-1}}` 和 `{{ ti.try_number - 1 }}` 一樣，空格不影響。
+5. **寫得進去是 PostgreSQL 在轉型：** 不是 Python 幫忙。字串 `"abc"` 會被 PostgreSQL 拒絕（`InvalidTextRepresentation`）。
+6. **DAG 和函式的參數名要對上：** DAG 多了這一項而函式沒有這個參數時，不會報錯。PythonOperator 會依函式的參數過濾 `op_kwargs`，對不上的 key 直接丟掉，欄位就一直是預設值 0，所以不能只看到 0 就當作有傳進來。自己直接呼叫函式才會報 `TypeError`。（2026-11-04 更正：原本寫 DAG 先上線會報 `TypeError`，Airflow 3.3.2 實跑不會。）
+7. **參數放第一個目前沒有影響：** 現有呼叫都用名字傳。如果有人直接寫 `extract_youbike("http://...")`，網址會被當成 `retry_count`。
+
+一句話記法：Airflow 知道第幾次，函式不知道，所以要傳；模板算完是字串，寫進資料庫前用 `int()` 統一。
+
+核對依據：範例 2、3、4 在本機 Youbike/.venv（Python 3.9.6）獨立執行，範例 3 連 youbike_test 但只用暫存表；範例 1 在 Youbike/.venv-airflow（Python 3.12.13）執行，因為 .venv 沒有 jinja2。16:00 的 `op_kwargs` 與 `try_number` 查自 Airflow metadata，`retry_count` 查自正式庫。那次跑的是 16:09 之前的存檔，16:09 的存檔要到下一次排程才上線。只驗證到第一次嘗試；`retry_count` 大於 0 的情況還沒實際發生過。本筆記不增加 D12 驗收完成數。
+
+## 2026-11-04：generate_series 和 expect.slot，先列出應該有的時間，再找缺少的
+
+問題：`generate_series(...) AS expect(slot)` 是什麼？`expect.slot` 是怎麼來的，要怎麼用？
+
+結論：**`generate_series(開始, 結束, 間隔)` 會產生一串值，一個值一列，不用先有資料表。`AS expect(slot)` 替這串值取名字：整組叫 `expect`，裡面那一欄叫 `slot`，後面用 `expect.slot` 拿到這一列的值。** 它只負責列出「應該有的」，要知道缺哪些，還要用 `NOT EXISTS` 去比對別的表。
+
+`expect` 和 `slot` 都是自己取的。聊天裡的範例叫 `expected`，這裡照 Andrew 11/04 18:30 的存檔寫 `expect`，效果一樣。
+
+### 這段怎麼拆
+
+| 片段 | 意思 |
+|---|---|
+| `generate_series(開始, 結束, 間隔)` | PostgreSQL 內建函式，從開始每次加一個間隔，超過結束就停；寫在 `FROM` 裡，用起來像一張表 |
+| `TIMESTAMPTZ '2026-01-01 09:00+00'` | 告訴 PostgreSQL 這段文字是含時區的時間；`+00` 是 UTC，`+08` 是台北 |
+| `INTERVAL '1 hour'` | 一段時間長度 |
+| `AS expect(slot)` | 括號外是這組資料的名字，括號內是欄位的名字 |
+| `expect.slot` | `expect` 這組資料的 `slot` 欄，和 `d.due_at` 是同一種寫法 |
+
+### 範例 1：不用資料表就能產生資料
+
+```python
+from dotenv import dotenv_values
+import psycopg
+
+dsn = dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
+
+with psycopg.connect(dsn, autocommit=True) as conn:
+    print(conn.execute("SELECT n FROM generate_series(1, 3) AS nums(n)").fetchall())
+    print(conn.execute("SELECT n FROM generate_series(1, 7, 2) AS nums(n)").fetchall())
+
+    rows = conn.execute(
+        """
+        SELECT t.slot
+        FROM generate_series(
+            TIMESTAMPTZ '2026-01-01 09:00+08',
+            TIMESTAMPTZ '2026-01-01 10:45+08',
+            INTERVAL '30 minutes'
+        ) AS t(slot)
+        """
+    ).fetchall()
+    print([r[0].strftime("%H:%M") for r in rows])
+```
+
+```text
+[(1,), (2,), (3,)]
+[(1,), (3,), (5,), (7,)]
+['09:00', '09:30', '10:00', '10:30']
+```
+
+數字省略間隔時是 1。結束點剛好落在格子上才會出現，所以第二行有 7；時間那行的下一格是 11:00，超過 10:45，所以停在 10:30。
+
+### 範例 2：`AS expect(slot)` 取的兩個名字
+
+```python
+from dotenv import dotenv_values
+import psycopg
+
+dsn = dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
+
+with psycopg.connect(dsn, autocommit=True) as conn:
+    for sql in [
+        "SELECT * FROM generate_series(1, 2)",
+        "SELECT * FROM generate_series(1, 2) AS expect",
+        "SELECT * FROM generate_series(1, 2) AS expect(slot)",
+    ]:
+        cursor = conn.execute(sql)
+        print([column.name for column in cursor.description], cursor.fetchall())
+
+    try:
+        conn.execute("SELECT expected.slot FROM generate_series(1, 2) AS expect(slot)")
+    except psycopg.Error as error:
+        print(type(error).__name__, str(error).splitlines()[0])
+```
+
+```text
+['generate_series'] [(1,), (2,)]
+['expect'] [(1,), (2,)]
+['slot'] [(1,), (2,)]
+UndefinedTable missing FROM-clause entry for table "expected"
+```
+
+前三行是欄位名和資料：
+
+- **不取名：** 欄位叫 `generate_series`。
+- **只寫 `AS expect`：** 欄位也跟著叫 `expect`，沒有 `slot`。
+- **寫 `AS expect(slot)`：** 欄位才叫 `slot`。
+
+最後一行是名字對不上：`AS` 後面叫 `expect`，卻去拿 `expected.slot`，PostgreSQL 找不到這個名字。
+
+### 範例 3：用 `expect.slot` 找出兩張表都沒有的時間點
+
+```python
+from dotenv import dotenv_values
+import psycopg
+
+dsn = dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
+
+with psycopg.connect(dsn, autocommit=True) as conn:
+    conn.execute("CREATE TEMP TABLE deliveries (due_at timestamptz PRIMARY KEY)")
+    conn.execute("CREATE TEMP TABLE receipts (due_at timestamptz PRIMARY KEY)")
+    conn.execute("INSERT INTO deliveries VALUES ('2026-01-01 09:00+00'), ('2026-01-01 10:00+00')")
+    conn.execute("INSERT INTO receipts VALUES ('2026-01-01 11:00+00')")
+    rows = conn.execute(
+        """
+        SELECT expect.slot
+        FROM generate_series(
+            TIMESTAMPTZ '2026-01-01 09:00+00',
+            TIMESTAMPTZ '2026-01-01 12:00+00',
+            INTERVAL '1 hour'
+        ) AS expect(slot)
+        WHERE NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.due_at = expect.slot)
+          AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.due_at = expect.slot)
+        ORDER BY expect.slot
+        """
+    ).fetchall()
+    print(len(rows), [r[0].strftime("%H:%M %Z") for r in rows])
+```
+
+```text
+1 ['20:00 CST']
+```
+
+可以想成一列一列比對：
+
+| `expect.slot`（UTC） | deliveries | receipts | 結果 |
+|---|---|---|---|
+| 09:00 | 有 | 沒有 | 不留 |
+| 10:00 | 有 | 沒有 | 不留 |
+| 11:00 | 沒有 | 有 | 不留 |
+| 12:00 | 沒有 | 沒有 | 留下 |
+
+`expect.slot` 在這段有三種用法：
+
+- **`SELECT expect.slot`：** 把這個時間印出來。
+- **`d.due_at = expect.slot`：** 拿這一列的時間去另一張表查。輪到 09:00 時，這句就是在問「deliveries 有沒有 09:00」。
+- **`ORDER BY expect.slot`：** 照時間排序。
+
+`SELECT 1` 的 1 沒有特別意思，`EXISTS` 只看查不查得到列。留下的 12:00 UTC 就是台北 20:00；連線的時區是台北，所以印成 `20:00 CST`。
+
+### 範例 4：為什麼要寫 `expect.slot`，不要只寫 `slot`
+
+這裡故意把欄位取成和 deliveries 一樣的 `due_at`。
+
+```python
+from dotenv import dotenv_values
+import psycopg
+
+dsn = dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
+
+with psycopg.connect(dsn, autocommit=True) as conn:
+    conn.execute("CREATE TEMP TABLE deliveries (due_at timestamptz PRIMARY KEY)")
+    conn.execute("INSERT INTO deliveries VALUES ('2026-01-01 09:00+00'), ('2026-01-01 10:00+00')")
+    sql = """
+        SELECT count(*)
+        FROM generate_series(
+            TIMESTAMPTZ '2026-01-01 09:00+00',
+            TIMESTAMPTZ '2026-01-01 12:00+00',
+            INTERVAL '1 hour'
+        ) AS expect(due_at)
+        WHERE NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.due_at = {right_side})
+    """
+    print("expect.due_at:", conn.execute(sql.format(right_side="expect.due_at")).fetchone()[0])
+    print("due_at:", conn.execute(sql.format(right_side="due_at")).fetchone()[0])
+```
+
+```text
+expect.due_at: 2
+due_at: 0
+```
+
+11:00、12:00 明明沒有，只寫 `due_at` 卻查出 0 個，而且不會報錯。子查詢會先找自己這層的表，所以這句變成 `d.due_at = d.due_at`，只要 deliveries 有資料就成立。前面加上 `expect.` 才是外面這一列的時間。
+
+### 範例 5：起點決定查到什麼
+
+deliveries 有 09:00、10:00、11:00，真正缺的只有 12:00，所以正確答案是 1。
+
+```python
+from dotenv import dotenv_values
+import psycopg
+
+dsn = dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
+
+with psycopg.connect(dsn, autocommit=True) as conn:
+    conn.execute("CREATE TEMP TABLE deliveries (due_at timestamptz PRIMARY KEY)")
+    conn.execute("INSERT INTO deliveries VALUES ('2026-01-01 09:00+00'), ('2026-01-01 10:00+00'), ('2026-01-01 11:00+00')")
+    sql = """
+        SELECT count(*)
+        FROM generate_series({start}, TIMESTAMPTZ '2026-01-01 12:00+00', INTERVAL '1 hour') AS expect(slot)
+        WHERE NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.due_at = expect.slot)
+    """
+    starts = {
+        "對齊": "date_trunc('hour', TIMESTAMPTZ '2026-01-01 09:17+00')",
+        "沒對齊": "TIMESTAMPTZ '2026-01-01 09:17+00'",
+        "太早": "TIMESTAMPTZ '2025-12-31 09:00+00'",
+    }
+    for name, start in starts.items():
+        print(name, conn.execute(sql.format(start=start)).fetchone()[0])
+```
+
+```text
+對齊 1
+沒對齊 3
+太早 25
+```
+
+- **對齊：** `date_trunc('hour', ...)` 把 09:17 切回 09:00，結果正確。
+- **沒對齊：** 產生的是 09:17、10:17、11:17，每個都比不到資料，全被算成缺少；真正缺的 12:00 反而沒列出來。
+- **太早：** 從前一天 09:00 開始，資料開始之前的 24 個時間也被算成缺少。
+
+### 對照本專案
+
+| 範例 | 專案 |
+|---|---|
+| `deliveries.due_at` | `raw_bytes.fetched_start_at` |
+| `receipts.due_at` | `run_status.scheduled_at` |
+| `INTERVAL '1 hour'` | `INTERVAL '30 minutes'`，和排程一樣每 30 分鐘一個 slot |
+| 寫死的開始和結束 | 最近 7 天，起點對齊整點，終點 `now() - INTERVAL '30 minutes'`，避開還在跑的 slot |
+
+起點要對齊，是因為正式排程寫入的時間都在 :00 或 :30，差一分鐘就比不到。
+
+[dashboard](de_transition_daily_dashboard.html) 的 D12-D 要的是「查得出應有卻沒有 run 的 slot」。最近 7 天和同時查 `raw_bytes` 是助理的建議，不是 HTML 的字句：11/03 18:30 之前還沒有 run 紀錄，只看 `run_status` 的話，舊 slot 全會被算成缺口。
+
+2026-11-04 查正式庫時，最近 7 天兩張表都沒有的是 11/03 17:30、18:00 兩個 slot。
+
+### 容易混淆的地方
+
+1. **名字不是關鍵字：** `expect`、`slot` 換成別的也可以，只要 `AS` 後面和使用的地方一致。
+2. **`INTERVAL` 的數字和單位都放在引號裡：** `INTERVAL 30 'minutes'` 會報 `syntax error at or near "30"`，要寫 `INTERVAL '30 minutes'`。
+3. **時間一定要給間隔：** 少了第三個參數會報 `function generate_series(timestamp with time zone, timestamp with time zone) does not exist`。
+4. **三個參數不能全是沒標型別的字串：** 會報 `function generate_series(unknown, unknown, unknown) is not unique`，PostgreSQL 分不出要用哪個版本。其中一個有明確型別就可以，例如第二個參數是 `NOW() - INTERVAL '30 minutes'` 時，前後用字串也跑得動。
+5. **開始比結束晚不會報錯：** 只會回 0 列，看起來像「沒有缺口」。查到 0 列時要先確認範圍對不對。
+
+一句話記法：`generate_series` 列出應該有的時間，`AS expect(slot)` 替它取名，`expect.slot` 拿這個時間去別的表比對。
+
+核對依據：範例都在本機 Youbike/.venv（Python 3.9.6）獨立執行，要在 `Youbike/` 底下跑才讀得到 `.env`；連 youbike_test（PostgreSQL 16.13），只用暫存表。第 2～5 點的訊息和結果也是同一環境實跑。兩個缺口來自 2026-11-04 下午的正式庫查詢，這次沒有重查。本筆記不增加 D12 驗收完成數。
