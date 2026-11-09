@@ -1038,3 +1038,369 @@ with psycopg.connect(dsn, autocommit=True) as conn:
 一句話記法：`generate_series` 列出應該有的時間，`AS expect(slot)` 替它取名，`expect.slot` 拿這個時間去別的表比對。
 
 核對依據：範例都在本機 Youbike/.venv（Python 3.9.6）獨立執行，要在 `Youbike/` 底下跑才讀得到 `.env`；連 youbike_test（PostgreSQL 16.13），只用暫存表。第 2～5 點的訊息和結果也是同一環境實跑。兩個缺口來自 2026-11-04 下午的正式庫查詢，這次沒有重查。本筆記不增加 D12 驗收完成數。
+
+## 2026-11-08：from config import 為什麼有時找得到、有時找不到
+
+問題：任何位置都能只靠 `from config import get_env_variable` 拿到 function 嗎？為什麼好像 `src` 底下可以，其他資料夾不行？
+
+結論：**找不找得到，看的是程式怎麼啟動，不是寫 import 的檔案放在哪個資料夾。** Python 啟動時會建一份搜尋清單 `sys.path`，整個程式共用這一份；`from config import ...` 就照這份清單找 `config.py`。在 `Youbike` 根目錄用 `-m` 啟動，清單第一個就是根目錄，任何資料夾裡的檔案都找得到根目錄的 `config.py`。`src` 沒有特別。
+
+### 清單第一個資料夾怎麼決定
+
+| 啟動方式 | `sys.path[0]` |
+|---|---|
+| `python 資料夾/檔案.py` | 那個檔案所在的資料夾 |
+| `python -m 模組名` | 目前所在的資料夾 |
+| Airflow 跑 DAG | DAG 自己插進去的 `Youbike` 根目錄（`dags/youbike_realtime.py` 第 5–6 行） |
+
+### 範例 1：同一個檔案，換啟動方式結果就不同
+
+`helper.py` 放在根目錄，內容是 `def hello(): return "found helper"`。
+
+```python
+# pkg/run.py
+import sys
+print("sys.path[0] =", repr(sys.path[0]))
+from helper import hello
+print(hello())
+```
+
+```python
+# pkg/run_insert.py
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from helper import hello
+print(hello())
+```
+
+```text
+-- 1 by path, from root
+    from helper import hello
+ModuleNotFoundError: No module named 'helper'
+-- 2 with -m, from root
+sys.path[0] = '<root>'
+found helper
+-- 3 insert root first, from /tmp
+found helper
+```
+
+- **跑法 1（在根目錄執行 `python pkg/run.py`）：** 用檔案路徑跑，清單第一個是 `pkg/`，找不到上一層的 `helper.py`。
+- **跑法 2（在根目錄執行 `python -m pkg.run`）：** 清單第一個是目前所在的根目錄，找得到。
+- **跑法 3（在 `/tmp` 執行 `run_insert.py`）：** DAG 的做法。`parents[1]` 是檔案往上兩層，也就是根目錄；先插進清單，從哪裡跑都找得到。
+
+### 範例 2：不同資料夾的檔案都找得到
+
+`tools/a.py` 和 `reports/deep/b.py` 內容一樣：先印出自己所在的資料夾和 `sys.path[0]`，再 `from helper import hello`。四次都在根目錄執行：
+
+```text
+-- python -m tools.a
+file folder: tools | sys.path[0]: '<root>'
+found helper
+-- python -m reports.deep.b
+file folder: reports/deep | sys.path[0]: '<root>'
+found helper
+-- python tools/a.py
+file folder: tools | sys.path[0]: '<root>/tools'
+ModuleNotFoundError: No module named 'helper'
+-- python reports/deep/b.py
+file folder: reports/deep | sys.path[0]: '<root>/reports/deep'
+ModuleNotFoundError: No module named 'helper'
+```
+
+用 `-m` 啟動時，檔案放在 `tools` 或更深的 `reports/deep` 都找得到；用路徑啟動時都找不到。
+
+### 在專案裡怎麼寫
+
+在 `Youbike` 根目錄用 `-m` 啟動後，任何檔案都能用「從根目錄算起的路徑」引用別的檔案：資料夾用 `.` 連起來，不寫 `.py`。
+
+| 檔案位置 | 引用寫法 |
+|---|---|
+| `config.py` | `from config import get_env_variable` |
+| `src/source_id.py` | `from src.source_id import Source` |
+| `src/extract/youbike.py` | `from src.extract.youbike import extract_youbike` |
+
+`src/extract/youbike.py` 第 8 行的 `from src.source_id import Source` 早就是這種寫法。
+
+目前的入口都在 `Youbike` 根目錄執行：`python -m pytest`、`python -m src.schedule_reconciliation`。Airflow 不受從哪裡啟動影響，因為 DAG 自己把根目錄插進清單。
+
+### 注意
+
+1. **路徑一律從根目錄寫起：** `youbike.py` 雖然在 `src/extract/` 裡，也要寫 `from src.source_id import Source`，不能只寫 `from source_id import Source`。
+2. **兩個檔案不要在最上面互相 `from ... import` 對方：** 會因為循環引用出現 `ImportError`。`config.py` 沒有引用專案裡的其他檔案，所以沒有這個問題。
+3. **編輯器的「執行檔案」按鈕通常用檔案路徑跑：** 子資料夾裡的檔案會出現 `No module named ...`，改在終端機用 `-m` 執行。
+4. **撞名：** 清單前面如果有別的 `config` 模組，會先被找到。2026-11-04 查過 `.venv` 和 Airflow 環境都沒有。
+5. **專案變大後：** 常見做法是把專案安裝成套件，或在 pytest 設定搜尋路徑，從哪裡執行都可以。目前不用改。
+
+一句話記法：import 找檔案靠的是啟動時的 `sys.path`；在 `Youbike` 根目錄用 `-m` 啟動，就能用「根目錄起算的路徑」引用任何檔案。
+
+核對依據：兩個範例都在本機 Youbike/.venv（Python 3.9.6）實跑，`<root>` 是範例資料夾。專案入口的說法依 `dags/youbike_realtime.py` 第 5–6 行，以及 2026-11-04 的實跑結果（`python src/schedule_reconciliation.py` 出現 `No module named 'src'`，改用 `-m` 可以）。本筆記不增加驗收完成數。
+
+## 2026-11-09：Pydantic 的 ConfigDict：寫在哪裡、有什麼用
+
+問題：`model_config = ConfigDict(strict=True)` 是什麼？除了 `strict` 還能設定什麼？
+
+結論：**`ConfigDict` 是整個模型的共同設定，寫在類別裡，名字固定叫 `model_config`。** 欄位宣告管「每個欄位是什麼型別、有什麼限制」，`ConfigDict` 管「整個模型怎麼驗證」，例如要不要自動轉型、遇到沒宣告的 key 怎麼辦。
+
+### 寫法
+
+```python
+from pydantic import BaseModel, ConfigDict
+
+class StrictBook(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    pages: int
+    price: float
+```
+
+- **名字固定：** `model_config` 是 Pydantic 規定的名字，寫成別的名字只是普通的類別屬性，不會生效。
+- **它就是 dict：** `ConfigDict(strict=True)` 在執行時等於 `{'strict': True}`，可以用 `StrictBook.model_config` 讀回來。
+- **不寫就用預設值。**
+- **版本：** 舊版 Pydantic v1 是在類別裡寫 `class Config:`；專案用的是 v2（2.13.5），要用 `ConfigDict`。
+
+### 常用設定
+
+| 設定 | 預設 | 作用 |
+|---|---|---|
+| `strict=True` | `False` | 不自動轉型：`"300"` 不算 int、`True` 不算 int、`"9.5"` 不算 float；int 給 float 欄位可以 |
+| `extra="ignore"` | 預設就是這個 | 沒宣告的 key 直接丟掉 |
+| `extra="forbid"` | — | 有沒宣告的 key 就報 `extra_forbidden` |
+| `extra="allow"` | — | 沒宣告的 key 也保留下來 |
+| `str_strip_whitespace=True` | `False` | 文字欄位自動去掉前後空白，會改到值 |
+
+### 範例：五種情況實跑
+
+```python
+import warnings
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+def check(model, data):
+    try:
+        print(model.__name__, "accepted", model.model_validate(data).model_dump())
+    except ValidationError as error:
+        print(model.__name__, "rejected", [(e["loc"], e["type"]) for e in error.errors()])
+
+
+print("-- 1. strict")
+
+
+class LaxBook(BaseModel):
+    pages: int
+    price: float
+
+
+class StrictBook(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    pages: int
+    price: float
+
+
+for data in ({"pages": "300", "price": "9.5"}, {"pages": True, "price": 10}):
+    check(LaxBook, data)
+    check(StrictBook, data)
+
+print("-- 2. extra")
+
+
+class IgnoreExtra(BaseModel):
+    title: str
+
+
+class ForbidExtra(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+
+
+class AllowExtra(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    title: str
+
+
+for model in (IgnoreExtra, ForbidExtra, AllowExtra):
+    check(model, {"title": "Data", "shelf": "A3"})
+
+print("-- 3. str_strip_whitespace")
+
+
+class Stripped(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str
+
+
+check(IgnoreExtra, {"title": "  Data  "})
+check(Stripped, {"title": "  Data  "})
+
+print("-- 4. misspelled key")
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+
+    class Typo(BaseModel):
+        model_config = ConfigDict(strick=True)
+
+        pages: int
+
+check(Typo, {"pages": "300"})
+print("warnings:", [str(w.message)[:70] for w in caught])
+
+print("-- 5. read the settings back")
+print(StrictBook.model_config)
+print(type(ConfigDict(strict=True)).__name__)
+```
+
+```text
+-- 1. strict
+LaxBook accepted {'pages': 300, 'price': 9.5}
+StrictBook rejected [(('pages',), 'int_type'), (('price',), 'float_type')]
+LaxBook accepted {'pages': 1, 'price': 10.0}
+StrictBook rejected [(('pages',), 'int_type')]
+-- 2. extra
+IgnoreExtra accepted {'title': 'Data'}
+ForbidExtra rejected [(('shelf',), 'extra_forbidden')]
+AllowExtra accepted {'title': 'Data', 'shelf': 'A3'}
+-- 3. str_strip_whitespace
+IgnoreExtra accepted {'title': '  Data  '}
+Stripped accepted {'title': 'Data'}
+-- 4. misspelled key
+Typo accepted {'pages': 300}
+warnings: []
+-- 5. read the settings back
+{'strict': True}
+dict
+```
+
+1. **strict：** 沒設時，`"300"` 被轉成 300、`True` 被轉成 1，資料默默變了；設了 strict 就報 `int_type`、`float_type`。第二組的 `price: 10` 在 strict 下也接受，會變成 `10.0`。
+2. **extra：** 同一筆多了 `shelf`，預設丟掉，`forbid` 報錯，`allow` 保留。
+3. **str_strip_whitespace：** 沒設時保留原本的空白；設了以後值被改成 `'Data'`。
+4. **拼錯不會報錯：** `strick=True` 沒有任何警告，也沒有生效，`"300"` 照樣被轉成 300。寫完可以用 `model_config` 讀回來確認，或拿一筆應該被擋的資料試一次。
+5. **讀回設定：** `StrictBook.model_config` 印出 `{'strict': True}`，`ConfigDict(...)` 的型別就是 `dict`。
+
+### 用在 YouBike 來源模型（任務 2）
+
+- **用 `strict=True`：** 和現在 `check_json` 的規則一致：型別要精確，bool 不算整數，座標給 int 也可以。
+- **`extra` 用預設：** 官方資料每列還有 8 個模型不宣告的欄位（`mday`、`ar`、`sareaen`、`snaen`、`aren`、`updateTime`、`infoTime`、`infoDate`），設成 `forbid` 會讓每一列都被擋下來。
+- **不用 `str_strip_whitespace`：** 它會改掉原始文字。檢查「不能是空白」用 `field_validator`，回傳原值。
+
+一句話記法：欄位宣告管單一欄位，`model_config = ConfigDict(...)` 管整個模型；YouBike 用 `strict=True`，其餘保持預設。
+
+核對依據：範例在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）實跑一次。8 個欄位名來自 2026-11-04 對正式庫最新 raw 的唯讀檢查。本筆記不增加驗收完成數。
+
+## 2026-11-09：Pydantic 和 model_validate 的關係：類別寫規則，model_validate 執行檢查
+
+問題：Pydantic 和 `model_validate` 是什麼關係？
+
+結論：**Pydantic 是套件；繼承 `BaseModel` 的類別把規則寫下來；`model_validate` 是拿一筆資料去照這些規則檢查的入口。** 合格就回傳模型物件，不合格就丟出 `ValidationError`。類別本身只是規則，沒有呼叫 `model_validate` 或其他驗證入口之前，什麼都不會被檢查。
+
+### 三者的分工
+
+| 角色 | 是什麼 | 誰寫 |
+|---|---|---|
+| Pydantic | 套件，提供 `BaseModel`、`Field`、`ConfigDict`、`field_validator` 等工具 | 現成的 |
+| 模型類別（繼承 `BaseModel`） | 寫規則：有哪些欄位、什麼型別、什麼限制 | 你 |
+| `模型.model_validate(資料)` | 照類別的規則檢查一筆資料，回傳物件或丟錯 | 你在程式裡呼叫 |
+
+`model_validate` 是 `BaseModel` 內建的 classmethod。類別只要繼承 `BaseModel`，就能直接用 `類別名.model_validate(...)`，不用自己定義。
+
+### 呼叫 model_validate 時發生什麼
+
+1. 照欄位宣告檢查型別和限制，例如 `ConfigDict(strict=True)`、`Field(ge=0)`。
+2. 跑 `@field_validator`：單一欄位的自訂檢查。
+3. 所有欄位都過了，才跑 `@model_validator(mode="after")`：拿整筆資料一起檢查。
+4. 全部通過就回傳物件；只要有一關沒過，就把所有錯誤收集起來，一次丟出 `ValidationError`。
+
+### 範例：五種寫法實跑
+
+```python
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+
+class Ticket(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    seat: str
+    price: int = Field(ge=0)
+
+    @field_validator("seat")
+    @classmethod
+    def seat_not_blank(cls, value):
+        print("  field_validator seat:", repr(value))
+        if not value.strip():
+            raise ValueError("seat cannot be empty")
+        return value
+
+    @model_validator(mode="after")
+    def whole_ticket(self):
+        print("  model_validator after:", self.seat, self.price)
+        return self
+
+
+print("-- 1. model_validate(dict)")
+ticket = Ticket.model_validate({"seat": "A1", "price": 300})
+print(type(ticket).__name__, ticket.seat, ticket.price)
+
+print("-- 2. Ticket(...) runs the same checks")
+print(Ticket(seat="B2", price=100).model_dump())
+
+print("-- 3. bad data")
+try:
+    Ticket.model_validate({"seat": "  ", "price": -1})
+except ValidationError as error:
+    print([(e["loc"], e["type"]) for e in error.errors()])
+
+print("-- 4. model_validate_json")
+print(Ticket.model_validate_json('{"seat": "C3", "price": 50}').model_dump())
+
+print("-- 5. model_construct skips validation")
+print(Ticket.model_construct(seat="  ", price=-1).model_dump())
+```
+
+```text
+-- 1. model_validate(dict)
+  field_validator seat: 'A1'
+  model_validator after: A1 300
+Ticket A1 300
+-- 2. Ticket(...) runs the same checks
+  field_validator seat: 'B2'
+  model_validator after: B2 100
+{'seat': 'B2', 'price': 100}
+-- 3. bad data
+  field_validator seat: '  '
+[(('seat',), 'value_error'), (('price',), 'greater_than_equal')]
+-- 4. model_validate_json
+  field_validator seat: 'C3'
+  model_validator after: C3 50
+{'seat': 'C3', 'price': 50}
+-- 5. model_construct skips validation
+{'seat': '  ', 'price': -1}
+```
+
+1. **`model_validate(dict)`：** 先跑欄位檢查，再跑整筆檢查，回傳 `Ticket` 物件。
+2. **`Ticket(...)` 也會檢查：** 直接用類別建立物件，跑的是同一套檢查。差別只在輸入寫法：`model_validate` 收一個 dict，`Ticket(...)` 收具名參數。從 JSON 解出來的 dict 用 `model_validate` 比較直接。
+3. **不合格：** `seat` 和 `price` 兩個錯誤一次回報；欄位沒過，`model_validator` 就不會執行。
+4. **`model_validate_json`：** 直接收 JSON 字串，解析和檢查一起做。
+5. **`model_construct` 不檢查：** 空白座位和負價格都照收。它是給已經確定合法的資料用的，來源資料不要用它。
+
+### 容易搞混的名字
+
+| 名字 | 是什麼 |
+|---|---|
+| `model_validate` | classmethod，呼叫它去檢查一筆資料 |
+| `model_validator` | 裝飾器，寫在類別裡的整筆資料自訂檢查，在 `model_validate` 執行過程中被呼叫 |
+| `field_validator` | 裝飾器，單一欄位的自訂檢查，也在 `model_validate` 執行過程中被呼叫 |
+| `TypeAdapter(...).validate_python(...)` | 要檢查的不是模型、而是 list 這類型別時用的入口，例如一次檢查整批 |
+
+### 用在 YouBike 來源模型（任務 2）
+
+- **規則寫在模型類別：** `src/extract/youbike_model.py`。
+- **產品程式負責呼叫：** 拿到官方資料的一列（dict）時呼叫 `model_validate` 檢查；要一次檢查整批就用 `TypeAdapter`。
+- **錯誤分類不變：** `ValidationError` 是 `ValueError` 的子類，所以 Airflow 的分類照舊，不重試。
+
+一句話記法：類別寫規則，`model_validate` 執行規則；沒呼叫就沒檢查。
+
+核對依據：範例在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）實跑一次；`ValidationError` 是 `ValueError` 子類，是 2026-11-04 在同一環境實測的結果。本筆記不增加驗收完成數。
