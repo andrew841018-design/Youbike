@@ -4,53 +4,27 @@ import os
 from time import monotonic
 from zoneinfo import ZoneInfo
 from datetime import datetime as DateTime,timezone,timedelta
-from dotenv import load_dotenv
 from src.source_id import Source
+from config import get_env_variable
+from src.extract.youbike_model import YoubikeStations
 import logging
 import uuid
 from json import loads
-
 import argparse
 
-load_dotenv("/Users/andrew/Desktop/andrew/Data_engineer/Youbike/.env")
 load_count=[]
-def check_json(row,type_,col):
-    allowed_types = (int, float) if type_ is float else (type_,)
-    if type(row[col]) not in allowed_types:
-        raise ValueError(f"{col} must be {allowed_types}")
-    if col not in row:
-        raise ValueError(f"Missing column: {col}")
-    if type_==int and row[col]<0:
-        raise ValueError(f"{col} cannot be negative")
-# isinstance(row[col],bool) 可以把row[col]=true/false抓出來，所以就可以過濾type=int,row[col]=true這種測資
-    if isinstance(row[col],bool) and type_ == int:
-        raise ValueError(f"{row[col]} cannot be boolean")
-    if type_ == str:
-        if not row[col].strip():
-            raise ValueError(f"{col} cannot be empty")
-def parse_station(row):
-    check_json(row,str,"sno")
-    check_json(row,str,"sna")
-    check_json(row,str,"sarea")
-    check_json(row,float,"latitude")
-    check_json(row,float,"longitude")
-    check_json(row,int,"Quantity")
-    check_json(row,int,"available_rent_bikes")
-    check_json(row,int,"available_return_bikes")
-    check_json(row,str,"act")
-    check_json(row,str,"srcUpdateTime")
-    station_id = row["sno"]
-    station_name = row["sna"]
-    station_area = row["sarea"]
-    latitude = row["latitude"]
-    longitude = row["longitude"]
-    quantity = row["Quantity"]
-    available_rent_bikes = row["available_rent_bikes"]
-    available_rent_bikes = row["available_rent_bikes"]
-    available_return_bikes = row["available_return_bikes"]
-    station_active = row["act"]
+def parse_station(station):
+    station_id = station.sno
+    station_name = station.sna
+    station_area = station.sarea
+    latitude = station.latitude
+    longitude = station.longitude
+    quantity = station.Quantity
+    available_rent_bikes = station.available_rent_bikes
+    available_return_bikes = station.available_return_bikes
+    station_active = station.act
     """"deal with timezone"""
-    time=row["srcUpdateTime"]
+    time=station.srcUpdateTime
     parsed=DateTime.strptime(time,"%Y-%m-%d %H:%M:%S")
     taipei_time=parsed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
     utc_time=taipei_time.astimezone(timezone.utc)
@@ -59,7 +33,7 @@ def parse_station(row):
 def load_youbike(batch_id):
     inserted_count = 0
     skipped_count = 0
-    database_url = os.environ["YOUBIKE_DATABASE_URL"]
+    database_url = get_env_variable("YOUBIKE_DATABASE_URL")
     global load_count
     load_count.append(batch_id)
     with psycopg.connect(database_url) as conn:
@@ -68,17 +42,13 @@ def load_youbike(batch_id):
             if row is None:
                 raise ValueError(f"Batch ID {batch_id} not found")
             body,batch_id,fetch_start_at = row
-            json=loads(body)
-            if json==[] or json=={} or isinstance(json,list)==False:
-                raise ValueError("Response is empty")
+            stations = YoubikeStations.validate_python(loads(body))
             record = cursor.execute("SELECT batch_id,station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time FROM response WHERE fetched_start_at = %s", (fetch_start_at,)).fetchall()
             existing = {row[1]: row for row in record} # {"station_id":(batch_id,station_id,station_name....)}
-        for row in json:
-            if not isinstance(row,dict):
-                raise ValueError("Response is not a dictionary/json")#json is api format=dict in python
-            parsed = parse_station(row)
-            if row["sno"] in existing:
-                db_row = existing[row["sno"]]  # DB 查回的整列，第一項是 batch_id
+        for station in stations:
+            parsed = parse_station(station)
+            if station.sno in existing:
+                db_row = existing[station.sno]  # DB 查回的整列，第一項是 batch_id
                 db_values = db_row[1:]  # 去掉 batch_id，剩下的十欄與 parsed 順序相同
                 if db_values != parsed:
                     raise ValueError("DB and parsed data not match")
@@ -130,8 +100,7 @@ def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/do
     buffer = bytearray()
     finish_sql_cmd = "UPDATE run_status SET status = %s, finished_at = now(), duration = now() - started_at,inserted_count = %s, skipped_count = %s, retry_count = %s WHERE run_id = %s"
     fail_sql_cmd = "UPDATE run_status SET status = %s, finished_at = now(), duration = now() - started_at, error_code = %s, inserted_count = %s, skipped_count = %s, retry_count = %s WHERE run_id = %s"
-    assert os.environ.get("YOUBIKE_DATABASE_URL")
-    with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"], autocommit=True) as conn:
+    with psycopg.connect(get_env_variable("YOUBIKE_DATABASE_URL"), autocommit=True) as conn:
         run_id = None
         try:
             with conn.cursor() as cursor:

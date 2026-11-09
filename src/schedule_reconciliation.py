@@ -1,8 +1,8 @@
-from dotenv import dotenv_values
 import psycopg
 from src.extract.youbike import extract_youbike
+from config import get_env_variable
 
-dsn = dotenv_values(".env")["YOUBIKE_DATABASE_URL"]
+dsn = get_env_variable("YOUBIKE_DATABASE_URL")
 with psycopg.connect(dsn,autocommit=True) as conn:
     for slot in conn.execute("""
     SELECT expect.slot 

@@ -1,6 +1,5 @@
 import pytest
 import json
-from dotenv import dotenv_values
 import logging
 
 import os
@@ -13,21 +12,6 @@ import sys
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-@pytest.fixture
-def youbike_test_env(monkeypatch):
-    settings = dotenv_values(".env")
-    test_db = settings.get("YOUBIKE_TEST_DATABASE_URL")
-    if not test_db:
-        raise RuntimeError("YOUBIKE_TEST_DATABASE_URL not found in .env")
-    monkeypatch.setenv("YOUBIKE_DATABASE_URL", test_db)
-    with psycopg.connect(os.environ["YOUBIKE_DATABASE_URL"]) as conn:
-        database = conn.execute("SELECT current_database()").fetchone()[0]
-        if database != "youbike_test":
-            raise RuntimeError("Database name is not youbike_test")
-        try:
-            yield conn
-        finally:
-            conn.rollback()
 @pytest.fixture
 def controlled_raw_http_server():
     """Serve stored raw bytes with request counting and response control."""
@@ -61,8 +45,8 @@ def controlled_raw_http_server():
             thread.join()
 
 @pytest.fixture
-def existing_raw(youbike_test_env):
-    conn = youbike_test_env
+def existing_raw(check_database_name):
+    conn = check_database_name
     batch_id = "a10a2ce6-b198-42fb-9cd6-2c0a629633f5"
     row = conn.execute("SELECT batch_id, fetched_start_at, body FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
     if row is None:
@@ -89,8 +73,8 @@ def start_youbike_worker(url, slot, now):
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
 
-def test_two_youbike_workers_enter_at_same_time(controlled_raw_http_server,youbike_test_env):
-    cnn = youbike_test_env
+def test_two_youbike_workers_enter_at_same_time(controlled_raw_http_server,check_database_name):
+    cnn = check_database_name
     control = controlled_raw_http_server
     with cnn.cursor() as cursor:
         scrape_time = cursor.execute("SELECT date_trunc('hour', COALESCE(MIN(fetched_start_at),NOW()),'UTC') - INTERVAL '60 minutes' AS scrape_time FROM raw_bytes").fetchone()[0]
@@ -133,9 +117,9 @@ def test_existing_raw_replays_without_http(existing_raw,controlled_raw_http_serv
     assert raw["batch_id"] in youbike_module.load_count
 
 
-def test_expired_without_raw_is_missing(caplog,youbike_test_env,controlled_raw_http_server,monkeypatch):
+def test_expired_without_raw_is_missing(caplog,check_database_name,controlled_raw_http_server,monkeypatch):
     control = controlled_raw_http_server
-    conn = youbike_test_env
+    conn = check_database_name
     with conn.cursor() as cursor:
         slot = cursor.execute("SELECT date_trunc('hour', COALESCE(MIN(fetched_start_at),NOW()),'UTC') - INTERVAL '60 minutes' FROM raw_bytes").fetchone()[0]
         # 產品呼叫 DateTime.now(...) 時固定回傳 expire_time（slot 剛好到期的那一刻）

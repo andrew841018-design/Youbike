@@ -1,4 +1,3 @@
-from dotenv import dotenv_values
 import psycopg
 import uuid
 import os
@@ -6,18 +5,8 @@ from datetime import datetime
 import zoneinfo
 from psycopg.errors import NotNullViolation,UniqueViolation,CheckViolation,ForeignKeyViolation
 import pytest
-@pytest.fixture
-def test_env():
-    test_db = os.environ.get("YOUBIKE_TEST_DATABASE_URL") or dotenv_values(".env")["YOUBIKE_TEST_DATABASE_URL"]
-    with psycopg.connect(test_db) as conn:
-        database=conn.execute("SELECT current_database()").fetchone()[0]
-        if database != "youbike_test":
-            raise RuntimeError("Database name is not youbike_test")
-        try:
-            yield conn
-        finally:
-            conn.rollback()
-def test_schema(test_env):
+def test_schema(check_database_name):
+    test_env = check_database_name
     batch_id =str(uuid.uuid4())
     station_id = str(uuid.uuid4())
     taipei_tz=zoneinfo.ZoneInfo("Asia/Taipei")
