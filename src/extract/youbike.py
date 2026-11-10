@@ -1,6 +1,5 @@
 import requests
 import psycopg
-import os
 from time import monotonic
 from zoneinfo import ZoneInfo
 from datetime import datetime as DateTime,timezone,timedelta
@@ -12,45 +11,38 @@ import uuid
 from json import loads
 import argparse
 
-load_count=[]
 def parse_station(station):
-    station_id = station.sno
-    station_name = station.sna
-    station_area = station.sarea
+    station_id = station.station_id
+    station_name = station.station_name
+    station_area = station.station_area
     latitude = station.latitude
     longitude = station.longitude
-    quantity = station.Quantity
+    quantity = station.quantity
     available_rent_bikes = station.available_rent_bikes
     available_return_bikes = station.available_return_bikes
-    station_active = station.act
+    station_active = station.station_active
     """"deal with timezone"""
-    time=station.srcUpdateTime
-    parsed=DateTime.strptime(time,"%Y-%m-%d %H:%M:%S")
-    taipei_time=parsed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
-    utc_time=taipei_time.astimezone(timezone.utc)
-    source_update_time = utc_time
+    source_update_time = DateTime.strptime(station.source_update_time,"%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Taipei")).astimezone(timezone.utc)
     return station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time
 def load_youbike(batch_id):
     inserted_count = 0
     skipped_count = 0
-    database_url = get_env_variable("YOUBIKE_DATABASE_URL")
-    global load_count
-    load_count.append(batch_id)
-    with psycopg.connect(database_url) as conn:
+    dsn = get_env_variable("YOUBIKE_DATABASE_URL")
+    with psycopg.connect(dsn) as conn:
         with conn.cursor() as cursor:
-            row  = cursor.execute("SELECT body,batch_id,fetched_start_at FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
-            if row is None:
+            raw = cursor.execute("SELECT body,batch_id,slot_time FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
+            if raw is None:
                 raise ValueError(f"Batch ID {batch_id} not found")
-            body,batch_id,fetch_start_at = row
+            body,batch_id,slot_time = raw
             stations = YoubikeStations.validate_python(loads(body))
-            record = cursor.execute("SELECT batch_id,station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time FROM response WHERE fetched_start_at = %s", (fetch_start_at,)).fetchall()
-            existing = {row[1]: row for row in record} # {"station_id":(batch_id,station_id,station_name....)}
+            existing_rows = cursor.execute("SELECT batch_id,station_id,station_name,station_area,latitude,longitude,quantity,available_rent_bikes,available_return_bikes,station_active,source_update_time FROM response WHERE slot_time = %s", (slot_time,)).fetchall()
+            existing_by_station = {db_row[1]: db_row for db_row in existing_rows} # {"station_id":(batch_id,station_id,station_name....)}
         for station in stations:
-            parsed = parse_station(station)
-            if station.sno in existing:
-                db_row = existing[station.sno]  # DB 查回的整列，第一項是 batch_id
-                db_values = db_row[1:]  # 去掉 batch_id，剩下的十欄與 parsed 順序相同
-                if db_values != parsed:
+            station_detail = parse_station(station)
+            if station.station_id in existing_by_station:
+                db_row = existing_by_station[station.station_id]  # DB 查回的整列，第一項是 batch_id
+                db_values = db_row[1:]  # 去掉 batch_id，剩下的十欄與 station_detail 順序相同
+                if db_values != station_detail:
                     raise ValueError("DB and parsed data not match")
                 if db_row[0] != batch_id:
                     raise ValueError("DB and raw batch_id not match")
@@ -64,39 +56,37 @@ def load_youbike(batch_id):
                 INSERT INTO response
                 (batch_id,station_id,station_name,station_area,latitude,
                 longitude,quantity,available_rent_bikes,
-                available_return_bikes,station_active,source_update_time,fetched_start_at)
+                available_return_bikes,station_active,source_update_time,slot_time)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (batch_id,parsed[0],parsed[1],parsed[2],parsed[3],parsed[4],parsed[5],parsed[6],parsed[7],parsed[8],parsed[9],fetch_start_at))
+                """, (batch_id,station_detail[0],station_detail[1],station_detail[2],station_detail[3],station_detail[4],station_detail[5],station_detail[6],station_detail[7],station_detail[8],station_detail[9],slot_time))
     return inserted_count, skipped_count
 
 
-def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json",scrape_time="2099-01-01T00:00:00+08:00"):
+def record_missing(conn, slot_time, retry_count=0):
+    conn.execute("INSERT INTO run_status (run_id, source, slot_time, status, retry_count, finished_at, duration) VALUES (%s, 'youbike', %s, 'missing', %s, now(), interval '0 seconds')", (str(uuid.uuid4()), slot_time, int(retry_count)))
+
+
+def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json",slot_time="2099-01-01T00:00:00+08:00"):
     inserted_count = 0
     skipped_count = 0
-    if scrape_time is None:
-        request_time = DateTime.now(timezone.utc)
+    if slot_time is None:
+        slot_time = DateTime.now(timezone.utc)
         ### 30 min align ###
-        request_time = request_time.replace(
-            minute=(request_time.minute // 30) * 30, second=0, microsecond=0
+        slot_time = slot_time.replace(
+            minute=(slot_time.minute // 30) * 30, second=0, microsecond=0
         )
     else:
-        if isinstance(scrape_time, str):
-            scrape_time = DateTime.fromisoformat(scrape_time.replace("Z", "+00:00"))
-        if scrape_time.utcoffset() is None:
-            raise ValueError("scrape_time must include timezone information")
-        request_time = scrape_time.astimezone(timezone.utc)
-    ## normalize reuquest time
-    event_time = DateTime(
-    request_time.year, request_time.month, request_time.day, request_time.hour, request_time.minute,
-    tzinfo=timezone.utc
-    )
-    seconds = event_time.timestamp()
-    half_hour_slot_id = int(seconds // 60 // 30) ## unit: 30 min
-    slot_key = (Source.YOUBIKE.value, half_hour_slot_id)
+        if isinstance(slot_time, str):
+            slot_time = DateTime.fromisoformat(slot_time.replace("Z", "+00:00"))
+        if slot_time.utcoffset() is None:
+            raise ValueError("slot_time must include timezone information")
+        slot_time = slot_time.astimezone(timezone.utc)
+    slot_id = int(slot_time.timestamp() // 60 // 30) ## unit: 30 min
+    slot_key = (Source.YOUBIKE.value, slot_id)
     batch_id = str(uuid.uuid4())
     budget_second = 30
     size_limit = 5*1024*1024
-    start_time = monotonic()
+    download_start = monotonic()
     buffer = bytearray()
     finish_sql_cmd = "UPDATE run_status SET status = %s, finished_at = now(), duration = now() - started_at,inserted_count = %s, skipped_count = %s, retry_count = %s WHERE run_id = %s"
     fail_sql_cmd = "UPDATE run_status SET status = %s, finished_at = now(), duration = now() - started_at, error_code = %s, inserted_count = %s, skipped_count = %s, retry_count = %s WHERE run_id = %s"
@@ -109,9 +99,16 @@ def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/do
                     logger = logging.getLogger(__name__)
                     logger.warning(f"Another process is already running for slot {slot_key}. Exiting.")
                     return
+                raw_row = cursor.execute("SELECT batch_id FROM raw_bytes WHERE slot_time = %s", (slot_time,)).fetchone()
+                # expired and nothing in raw_bytes
+                slot_end = slot_time + timedelta(minutes=30)
+                if raw_row is None and DateTime.now(timezone.utc) >= slot_end:
+                    logger = logging.getLogger(__name__)
+                    logger.warning("missing: no raw for slot %s (expired at %s). Exiting.", slot_time, slot_end)
+                    record_missing(conn, slot_time, retry_count)
+                    return
                 run_id = str(uuid.uuid4())
-                cursor.execute("INSERT INTO run_status (run_id, source, scheduled_at, status,retry_count) VALUES (%s, 'youbike', %s, 'running', %s)", (run_id, request_time, int(retry_count)))
-                raw_row = cursor.execute("SELECT batch_id FROM raw_bytes WHERE fetched_start_at = %s", (request_time,)).fetchone()
+                cursor.execute("INSERT INTO run_status (run_id, source, slot_time, status,retry_count) VALUES (%s, 'youbike', %s, 'running', %s)", (run_id, slot_time, int(retry_count)))
                 if raw_row is not None:
                     inserted_count, skipped_count = load_youbike(raw_row[0])# replay
                     cursor.execute(finish_sql_cmd, ("succeeded", inserted_count, skipped_count, int(retry_count), run_id))
@@ -122,25 +119,18 @@ def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/do
                         logger.warning(f"Failed to release advisory lock for slot {slot_key}.")
                         raise RuntimeError(f"Failed to release advisory lock for slot {slot_key}")
                     return
-                # expired and nothing in raw_bytes
-                expire_at = request_time + timedelta(minutes=30)
-                if DateTime.now(timezone.utc) >= expire_at:
-                    logger = logging.getLogger(__name__)
-                    logger.warning("missing: no raw for slot %s (expired at %s). Exiting.", request_time, expire_at)
-                    cursor.execute(finish_sql_cmd, ("missing", inserted_count, skipped_count, int(retry_count), run_id))
-                    return
             with requests.get(url,stream=True,timeout=(5,10)) as response:#5秒連線逾時，10秒下載逾時
                 if response.status_code != 200:
                     raise requests.HTTPError(f"Request failed with status code: {response.status_code}", response=response)
                 for chunk in response.iter_content(chunk_size=1024*64):
                     if len(buffer)+len(chunk)>size_limit:
                         raise ValueError("Response size limit exceeded")
-                    if monotonic()-start_time>=budget_second:
+                    if monotonic()-download_start>=budget_second:
                         raise TimeoutError("Time limit exceeded")
                     buffer.extend(chunk)
                 body = bytes(buffer)
             with conn.cursor() as cursor:
-                cursor.execute("INSERT INTO raw_bytes (body,fetched_start_at,batch_id) VALUES (%s,%s,%s)", (body,request_time,batch_id))
+                cursor.execute("INSERT INTO raw_bytes (body,slot_time,batch_id) VALUES (%s,%s,%s)", (body,slot_time,batch_id))
                 inserted_count, skipped_count = load_youbike(batch_id)
                 cursor.execute(finish_sql_cmd, ("succeeded", inserted_count, skipped_count, int(retry_count), run_id))
                 release_lock = cursor.execute("SELECT pg_advisory_unlock(%s, %s)", slot_key).fetchone()[0]
@@ -154,6 +144,6 @@ def extract_youbike(retry_count=0,url="https://tcgbusfs.blob.core.windows.net/do
             raise error
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scrape_time", type=DateTime.fromisoformat)
+    parser.add_argument("--slot_time", type=DateTime.fromisoformat)
     args = parser.parse_args()
-    extract_youbike(scrape_time=args.scrape_time)
+    extract_youbike(slot_time=args.slot_time)

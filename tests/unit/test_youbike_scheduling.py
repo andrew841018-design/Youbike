@@ -1,11 +1,9 @@
 import pytest
 import json
-import logging
 
 import os
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
-import psycopg
 import src.extract.youbike as youbike_module
 import subprocess
 import sys
@@ -45,22 +43,21 @@ def controlled_raw_http_server():
             thread.join()
 
 @pytest.fixture
-def existing_raw(check_database_name):
-    conn = check_database_name
+def existing_raw(test_conn):
     batch_id = "a10a2ce6-b198-42fb-9cd6-2c0a629633f5"
-    row = conn.execute("SELECT batch_id, fetched_start_at, body FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
+    row = test_conn.execute("SELECT batch_id, slot_time, body FROM raw_bytes WHERE batch_id = %s", (batch_id,)).fetchone()
     if row is None:
         raise RuntimeError(f"Batch ID {batch_id} not found in raw_bytes table")
-    batch_id, fetched_start_at, body = row
+    batch_id, slot_time, body = row
     dict = {
         "batch_id": batch_id,
-        "fetched_start_at": fetched_start_at,
+        "slot_time": slot_time,
         "body": body
     }
     return dict
 
 
-def start_youbike_worker(url, slot, now):
+def start_youbike_worker(url, slot_time, now):
     project_root = Path(__file__).resolve().parents[2]
     child_env = os.environ.copy()
     child_env["PYTHONPATH"] = os.pathsep.join(
@@ -68,73 +65,73 @@ def start_youbike_worker(url, slot, now):
     )
     return subprocess.Popen(
         [sys.executable, str(project_root / "tests/helpers/youbike_worker.py"),
-         "--url", url, "--slot", slot, "--now", now],
+         "--url", url, "--slot_time", slot_time, "--now", now],
         env=child_env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
 
-def test_two_youbike_workers_enter_at_same_time(controlled_raw_http_server,check_database_name):
-    cnn = check_database_name
-    control = controlled_raw_http_server
-    with cnn.cursor() as cursor:
-        scrape_time = cursor.execute("SELECT date_trunc('hour', COALESCE(MIN(fetched_start_at),NOW()),'UTC') - INTERVAL '60 minutes' AS scrape_time FROM raw_bytes").fetchone()[0]
-    slot = scrape_time.isoformat()
-    control["release"].clear()
+def test_two_youbike_workers_enter_at_same_time(controlled_raw_http_server,test_conn):
+    with test_conn.cursor() as cursor:
+        slot_time = cursor.execute("SELECT date_trunc('hour', COALESCE(MIN(slot_time),NOW()),'UTC') - INTERVAL '60 minutes' AS slot_time FROM raw_bytes").fetchone()[0]
+    slot_time_iso = slot_time.isoformat()
+    controlled_raw_http_server["release"].clear()
     try:
-        a=start_youbike_worker(control["url"], slot, slot)# A
-        assert control["received"].wait(timeout=5)## A get will release this also make sure A stuck in http request can't response
-        b=start_youbike_worker(control["url"], slot, slot)# B
+        a=start_youbike_worker(controlled_raw_http_server["url"], slot_time_iso, slot_time_iso)# A
+        assert controlled_raw_http_server["received"].wait(timeout=5)## A get will release this also make sure A stuck in http request can't response
+        b=start_youbike_worker(controlled_raw_http_server["url"], slot_time_iso, slot_time_iso)# B
         b.communicate(timeout=5)# wait for B to finish.
         assert b.returncode == 0 # make sure B finished successfully
         assert a.poll() is None # A is still running
-        control["release"].set()# release both A and B from http request
+        controlled_raw_http_server["release"].set()# release both A and B from http request
         a.communicate(timeout=5)
 
         assert a.returncode == 0
-        assert control["get_count"] == 1
-        with cnn.cursor() as cursor:
-            row = cursor.execute("SELECT count(*) FROM raw_bytes WHERE fetched_start_at = %s", (scrape_time,)).fetchone()
-            row_1 = cursor.execute("SELECT count(*) FROM response WHERE fetched_start_at = %s", (scrape_time,)).fetchone()
+        assert controlled_raw_http_server["get_count"] == 1
+        with test_conn.cursor() as cursor:
+            row = cursor.execute("SELECT count(*) FROM raw_bytes WHERE slot_time = %s", (slot_time,)).fetchone()
+            row_1 = cursor.execute("SELECT count(*) FROM response WHERE slot_time = %s", (slot_time,)).fetchone()
         assert row[0] == 1
         assert row_1[0] == 1
     except: # if B crash
         if b.returncode != 0:
             b.kill()
             assert a.poll() is None
-            control["release"].set()
+            controlled_raw_http_server["release"].set()
             a.communicate(timeout=5)
         raise
 
 
 
 
-def test_existing_raw_replays_without_http(existing_raw,controlled_raw_http_server):
-    raw = existing_raw
-    control = controlled_raw_http_server
+def test_existing_raw_replays_without_http(existing_raw,controlled_raw_http_server,monkeypatch):
+    loaded_batch_ids = []
+    load_youbike = youbike_module.load_youbike
+    def recording_load_youbike(batch_id):
+        loaded_batch_ids.append(batch_id)
+        return load_youbike(batch_id)
+    monkeypatch.setattr(youbike_module, "load_youbike", recording_load_youbike)
 
-    youbike_module.extract_youbike(url=control["url"],scrape_time=raw["fetched_start_at"].isoformat())
-    assert control["get_count"] == 0
-    assert raw["batch_id"] in youbike_module.load_count
+    youbike_module.extract_youbike(url=controlled_raw_http_server["url"],slot_time=existing_raw["slot_time"].isoformat())
+    assert controlled_raw_http_server["get_count"] == 0
+    assert existing_raw["batch_id"] in loaded_batch_ids
 
 
-def test_expired_without_raw_is_missing(caplog,check_database_name,controlled_raw_http_server,monkeypatch):
-    control = controlled_raw_http_server
-    conn = check_database_name
-    with conn.cursor() as cursor:
-        slot = cursor.execute("SELECT date_trunc('hour', COALESCE(MIN(fetched_start_at),NOW()),'UTC') - INTERVAL '60 minutes' FROM raw_bytes").fetchone()[0]
-        # 產品呼叫 DateTime.now(...) 時固定回傳 expire_time（slot 剛好到期的那一刻）
-        expire_time = slot + timedelta(minutes=30)
+def test_expired_without_raw_is_missing(caplog,test_conn,controlled_raw_http_server,monkeypatch):
+    with test_conn.cursor() as cursor:
+        slot_time = cursor.execute("SELECT date_trunc('hour', COALESCE(MIN(slot_time),NOW()),'UTC') - INTERVAL '60 minutes' FROM raw_bytes").fetchone()[0]
+        # 產品呼叫 DateTime.now(...) 時固定回傳 slot_end（slot 剛好到期的那一刻）
+        slot_end = slot_time + timedelta(minutes=30)
         class NewDateTime(datetime):
             @staticmethod
             def now(tz=None):
-                return expire_time.astimezone(tz) if tz else expire_time
+                return slot_end.astimezone(tz) if tz else slot_end
 
         monkeypatch.setattr(youbike_module, "DateTime", NewDateTime)
-        youbike_module.extract_youbike(url=control["url"],scrape_time=slot.isoformat())
-        count = cursor.execute("SELECT count(*) FROM raw_bytes WHERE fetched_start_at = %s", (slot,)).fetchone()[0]
-        assert control["get_count"] == 0
+        youbike_module.extract_youbike(url=controlled_raw_http_server["url"],slot_time=slot_time.isoformat())
+        count = cursor.execute("SELECT count(*) FROM raw_bytes WHERE slot_time = %s", (slot_time,)).fetchone()[0]
+        assert controlled_raw_http_server["get_count"] == 0
         assert count == 0
         assert "missing" in caplog.text
-        assert str(slot.astimezone(timezone.utc)) in caplog.text
+        assert str(slot_time.astimezone(timezone.utc)) in caplog.text
 
     

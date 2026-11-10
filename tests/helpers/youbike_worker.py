@@ -6,7 +6,7 @@ from src.extract.youbike import extract_youbike
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", type=str, required=True)
-    parser.add_argument("--slot", type=str, required=True)
+    parser.add_argument("--slot_time", type=str, required=True)
     parser.add_argument("--now", type=str, required=True)
     return parser.parse_args()
 
@@ -39,8 +39,8 @@ def main():
     args = parse_args()
     url = args.url
     set_worker_clock(args.now)
-    slot = args.slot
-    extract_youbike(url=url, scrape_time=slot)
+    slot_time = args.slot_time
+    extract_youbike(url=url, slot_time=slot_time)
 
 if __name__ == "__main__":
     main()

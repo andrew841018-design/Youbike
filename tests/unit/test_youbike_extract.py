@@ -7,15 +7,13 @@ from unittest.mock import MagicMock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 
-def test_extract_raw_body(check_database_name):
-    conn = check_database_name
-    before = conn.execute("SELECT count(DISTINCT batch_id) FROM raw_bytes").fetchone()[0]
-    slot = conn.execute("SELECT MAX(fetched_start_at)+ INTERVAL '60 minutes' FROM raw_bytes").fetchone()[0]
-    extract_youbike(scrape_time=slot)
-    after = conn.execute("SELECT count(DISTINCT batch_id) FROM raw_bytes").fetchone()[0]
+def test_extract_raw_body(test_conn):
+    before = test_conn.execute("SELECT count(DISTINCT batch_id) FROM raw_bytes").fetchone()[0]
+    slot_time = test_conn.execute("SELECT MAX(slot_time)+ INTERVAL '60 minutes' FROM raw_bytes").fetchone()[0]
+    extract_youbike(slot_time=slot_time)
+    after = test_conn.execute("SELECT count(DISTINCT batch_id) FROM raw_bytes").fetchone()[0]
     assert after == before + 1
-def test_db_failure(monkeypatch, switch_env):
-    test_dsn = switch_env
+def test_db_failure(monkeypatch, test_dsn):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         unused_port = sock.getsockname()[1]
@@ -44,7 +42,7 @@ def http_200_response(monkeypatch):
     return response
 
 
-def test_http_read_timeout(switch_env):
+def test_http_read_timeout(test_dsn):
     # TCP connects, but no HTTP response is sent. Keep the listener open.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -54,14 +52,14 @@ def test_http_read_timeout(switch_env):
             extract_youbike(url=f"http://127.0.0.1:{port}/")
 
 
-def test_response_size_limit(switch_env, http_200_response):
+def test_response_size_limit(test_dsn, http_200_response):
     # 80 chunks total 5 MiB; the final byte exceeds the limit.
     http_200_response.iter_content.return_value = [b"x" * (64 * 1024)] * 80 + [b"x"]# 5MiB
     with pytest.raises(ValueError, match=r"^Response size limit exceeded$"):
         extract_youbike()
 
 
-def test_stream_time_budget(switch_env, http_200_response, monkeypatch):
+def test_stream_time_budget(test_dsn, http_200_response, monkeypatch):
     http_200_response.iter_content.return_value = [b"x"]
     # The product sees 31 seconds elapsed without making the test wait.
     monkeypatch.setattr("src.extract.youbike.monotonic", MagicMock(side_effect=[0, 31]))
@@ -87,7 +85,7 @@ def test_station_model_quantity(quantity,should_raise):
     else:
         YoubikeStation.model_validate(row)
 @pytest.fixture
-def local_server(switch_env):
+def local_server(test_dsn):
     class handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(503)

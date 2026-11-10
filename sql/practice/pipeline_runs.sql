@@ -1,7 +1,7 @@
 CREATE TABLE run_status (
     run_id UUID PRIMARY KEY,
     source TEXT NOT NULL CHECK(btrim(source) <> ''),
-    scheduled_at TIMESTAMPTZ NOT NULL,
+    slot_time TIMESTAMPTZ NOT NULL,
     status TEXT CHECK(status in ('missing','running','succeeded','failed')) NOT NULL,
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ,

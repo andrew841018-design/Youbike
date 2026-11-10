@@ -33,7 +33,7 @@ with DAG(
         python_callable=extract_youbike,  # Replace with actual scraping logic
         op_kwargs={
             "retry_count":"{{ti.try_number-1}}",
-            "scrape_time": "{{ data_interval_end }}",
+            "slot_time": "{{ data_interval_end }}",
         },
         retries=4,
         retry_delay=60,  # Retry after 60 seconds
