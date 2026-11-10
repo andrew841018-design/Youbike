@@ -17,3 +17,5 @@ docs/raw_bytes_lab_state.json
 !/README.md
 !/docs/重點整理.md
 !/docs/engineering_challenges_log.md
+.venv-dbt/
+dbt/dbt_packages/

@@ -1,6 +1,4 @@
-import psycopg
 import uuid
-import os
 from datetime import datetime
 import zoneinfo
 from psycopg.errors import NotNullViolation,UniqueViolation,CheckViolation,ForeignKeyViolation

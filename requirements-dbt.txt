@@ -1,0 +1,3 @@
+# dbt runs in its own venv (.venv-dbt, Python 3.12); versions resolved and checked on 2026-11-09
+dbt-core==1.12.6
+dbt-postgres==1.11.0
