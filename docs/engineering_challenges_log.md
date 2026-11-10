@@ -1404,3 +1404,576 @@ Ticket A1 300
 一句話記法：類別寫規則，`model_validate` 執行規則；沒呼叫就沒檢查。
 
 核對依據：範例在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）實跑一次；`ValidationError` 是 `ValueError` 子類，是 2026-11-04 在同一環境實測的結果。本筆記不增加驗收完成數。
+
+## 2026-11-09：model_validate 接收什麼、回傳什麼
+
+問題：Pydantic 的 `model_validate` 接收什麼參數、什麼型別？回傳什麼？出錯會怎樣？
+
+結論：**`模型.model_validate(obj)` 是類別方法，第一個參數 `obj` 通常是一個 dict（key 對應欄位名稱）。檢查通過就回傳一個模型物件，不通過就丟 `ValidationError`。** 它不接受 JSON 文字，也不接受 list：JSON 文字用 `model_validate_json`，整批 list 用 `TypeAdapter(List[模型])`。
+
+### 參數
+
+| 參數 | 型別 | 用途 |
+|---|---|---|
+| `obj`（第一個，照位置傳） | 通常是 `dict`；搭配 `from_attributes=True` 時可以是有屬性的物件 | 要檢查的資料 |
+| `strict` | `bool` 或 `None` | 這次呼叫要不要用嚴格模式；`None` 時照類別的 `model_config` |
+| `extra` | `"ignore"`、`"allow"`、`"forbid"` 或 `None` | 這次呼叫怎麼處理多出來的 key；`None` 時照 `model_config` |
+| `from_attributes` | `bool` 或 `None` | 允許從物件的屬性讀值，例如 dataclass |
+| `context` | 任意 | 傳額外資訊給自訂的 validator 用 |
+| `by_alias`、`by_name` | `bool` 或 `None` | 欄位有 alias 時，要用 alias 還是欄位名稱去對 key |
+
+簽名裡的 `*` 表示後面的參數只能用關鍵字傳，例如 `strict=True`。
+
+### 範例：不同輸入、回傳值與錯誤
+
+```python
+import inspect
+from dataclasses import dataclass
+from typing import List
+
+import pydantic
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+
+
+class Item(BaseModel):
+    name: str
+    count: int
+
+
+def show(label, call):
+    try:
+        result = call()
+        print(f"{label:22} -> {result!r} ({type(result).__name__})")
+    except ValidationError as error:
+        print(f"{label:22} -> {[(e['loc'], e['type']) for e in error.errors()]}")
+
+
+print("pydantic", pydantic.VERSION)
+print("signature:", inspect.signature(Item.model_validate))
+show("dict", lambda: Item.model_validate({"name": "pen", "count": 2}))
+show("dict, extra key", lambda: Item.model_validate({"name": "pen", "count": 2, "color": "red"}))
+show("JSON text", lambda: Item.model_validate('{"name": "pen", "count": 2}'))
+show("model_validate_json", lambda: Item.model_validate_json('{"name": "pen", "count": 2}'))
+show("list of dicts", lambda: Item.model_validate([{"name": "pen", "count": 2}]))
+show("TypeAdapter list", lambda: TypeAdapter(List[Item]).validate_python([{"name": "pen", "count": 2}]))
+
+
+@dataclass
+class Row:
+    name: str
+    count: int
+
+
+show("object", lambda: Item.model_validate(Row("cup", 5)))
+show("object, from_attributes", lambda: Item.model_validate(Row("cup", 5), from_attributes=True))
+show("'5', default", lambda: Item.model_validate({"name": "pen", "count": "5"}))
+show("'5', strict=True", lambda: Item.model_validate({"name": "pen", "count": "5"}, strict=True))
+
+item = Item.model_validate({"name": "pen", "count": 2})
+print("attribute access:", item.name, item.count, "| model_dump:", item.model_dump())
+try:
+    Item.model_validate({"name": "pen", "count": "two"})
+except ValidationError as error:
+    first = error.errors()[0]
+    print("isinstance ValueError:", isinstance(error, ValueError), "| error count:", error.error_count())
+    print("one error dict keys:", sorted(first))
+    print("type/loc/msg/input:", first["type"], first["loc"], first["msg"], repr(first["input"]))
+```
+
+```text
+pydantic 2.13.5
+signature: (obj: 'Any', *, strict: 'bool | None' = None, extra: 'ExtraValues | None' = None, from_attributes: 'bool | None' = None, context: 'Any | None' = None, by_alias: 'bool | None' = None, by_name: 'bool | None' = None) -> 'Self'
+dict                   -> Item(name='pen', count=2) (Item)
+dict, extra key        -> Item(name='pen', count=2) (Item)
+JSON text              -> [((), 'model_type')]
+model_validate_json    -> Item(name='pen', count=2) (Item)
+list of dicts          -> [((), 'model_type')]
+TypeAdapter list       -> [Item(name='pen', count=2)] (list)
+object                 -> [((), 'model_type')]
+object, from_attributes -> Item(name='cup', count=5) (Item)
+'5', default           -> Item(name='pen', count=5) (Item)
+'5', strict=True       -> [(('count',), 'int_type')]
+attribute access: pen 2 | model_dump: {'name': 'pen', 'count': 2}
+isinstance ValueError: True | error count: 1
+one error dict keys: ['input', 'loc', 'msg', 'type', 'url']
+type/loc/msg/input: int_parsing ('count',) Input should be a valid integer, unable to parse string as an integer 'two'
+```
+
+- **dict：** 回傳 `Item` 物件。多出來的 key（`color`）預設會被忽略。
+- **JSON 文字：** 報 `model_type`，因為它要的是 dict。同一段文字改用 `model_validate_json` 就可以。
+- **list：** 同樣報 `model_type`。整批要用 `TypeAdapter(List[Item]).validate_python(...)`，回傳的是 list。
+- **一般物件：** 預設不接受，加 `from_attributes=True` 才會從屬性讀值。
+- **嚴格模式：** 預設會把 `'5'` 轉成 `5`；這次呼叫傳 `strict=True` 就會擋下（`int_type`）。寫在類別的 `model_config = ConfigDict(strict=True)`，就是每次呼叫都嚴格。
+- **回傳值：** 用 `.name`、`.count` 取值；`model_dump()` 轉回 dict。
+- **錯誤：** `ValidationError` 是 `ValueError` 的子類。`error.errors()` 是一個 list，每個錯誤是一個 dict，`type` 是錯誤種類、`loc` 是位置、`msg` 是說明、`input` 是收到的值；`error.error_count()` 是錯誤數量。
+
+### 在 YouBike 的對應
+
+- `loads(body)` 得到一個 list，每個元素是一個站的 dict。可以一列一列交給 `model_validate`，也可以整個 list 交給 `TypeAdapter(List[模型])`。
+- 嚴格模式寫在 `model_config`，不用每次呼叫都傳 `strict=True`。
+- 官方每一列有 18 個 key，模型只宣告用得到的 10 個，所以要維持預設的「忽略多出來的 key」。2026-11-09 拿一列真實資料實測，`extra="forbid"` 會被 8 個沒宣告的欄位擋下（`extra_forbidden`）。
+
+一句話記法：`model_validate` 吃 dict、回傳模型物件、錯了丟 `ValidationError`；JSON 文字用 `model_validate_json`，list 用 `TypeAdapter`。
+
+核對依據：範例在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）實跑，簽名取自 `inspect.signature`。18 個 key 的實測用 youbike_test 裡一列真實資料。本筆記不增加驗收完成數。
+
+## 2026-11-09：test_station_model_quantity 在測什麼，為什麼這樣寫
+
+問題：`tests/unit/test_youbike_extract.py` 的 `test_station_model_quantity` 在做什麼？為什麼是這 5 個值？
+
+結論：**它證明新的 `YoubikeStation` 模型對 `Quantity` 的規則，和原本 `check_json` 一樣嚴格。** 5 個案例就是原本 `test_check_json` 測 `Quantity` 用的那 5 個值，只是檢查的對象從 `check_json` 換成模型；這正是 E3-2「先用既有測試證明行為一樣，再替換」的做法。
+
+### 測試本體（2026-11-09 15:11 存檔，函式在第 82 行）
+
+```python
+VALID_STATION = {"sno":"1","sna":"model check","sarea":"fixture","latitude":25.03,"longitude":121.56,"Quantity":6,
+                 "available_rent_bikes":2,"available_return_bikes":4,"act":"1","srcUpdateTime":"2023-08-01 00:00:00"}
+@pytest.mark.parametrize("quantity,should_raise",
+    [
+        (0,False),
+        (10,False),
+        (-1,True),
+        (True,True),
+        (1.5,True)
+    ]
+)
+def test_station_model_quantity(quantity,should_raise):
+    row = dict(VALID_STATION, Quantity=quantity)
+    if should_raise:
+        with pytest.raises(ValidationError):
+            YoubikeStation.model_validate(row)
+    else:
+        YoubikeStation.model_validate(row)
+```
+
+### 怎麼跑
+
+1. **`VALID_STATION`：** 一筆 10 個欄位都合法的站，是基準，單獨丟進模型一定會通過。
+2. **`@pytest.mark.parametrize`：** 同一個測試跑 5 次，每次帶一組 `(quantity, should_raise)`。
+3. **`row = dict(VALID_STATION, Quantity=quantity)`：** 複製一份基準，只把 `Quantity` 換掉。每個案例只有 `Quantity` 不同，失敗就一定是 `Quantity` 造成的；而且是新的 dict，5 個案例之間不會互相污染。
+4. **檢查結果：** `should_raise` 是 `True` 時放在 `pytest.raises(ValidationError)` 裡，模型有丟錯才算過；是 `False` 時直接呼叫，沒丟錯就算過。
+
+### 範例：`dict(基準, 欄位=新值)` 會複製，不會改到基準
+
+```python
+base = {"name": "pen", "Count": 2}
+row = dict(base, Count=-1)
+print("row: ", row)
+print("base:", base)
+print("same object:", row is base)
+```
+
+```text
+row:  {'name': 'pen', 'Count': -1}
+base: {'name': 'pen', 'Count': 2}
+same object: False
+```
+
+### 為什麼是這 5 個值
+
+| 值 | 預期 | 被哪條規則擋 |
+|---|---|---|
+| `0` | 通過 | 邊界值，`ge=0` 包含 0 |
+| `10` | 通過 | 一般值 |
+| `-1` | 擋下 | `Field(ge=0)` |
+| `True` | 擋下 | `strict=True`；不開嚴格會被當成 `1` 通過 |
+| `1.5` | 擋下 | `strict=True`，int 欄位不收 float |
+
+### 為什麼只測 Quantity
+
+另外兩個車位數欄位（`available_rent_bikes`、`available_return_bikes`）用的是同一條 `Field(ge=0)`。依 2026-10-14 的去重原則，同一個機制沒有新的失敗方式，就不再各測一遍。
+
+一句話記法：基準一筆合法資料，每次只改一個值，看模型有沒有在該擋的時候丟 `ValidationError`。
+
+核對依據：測試本體逐字取自 2026-11-09 15:11 的存檔；`dict` 範例在本機 Youbike/.venv（Python 3.9.6）實跑；`True` 在不嚴格時會被當成 `1`，依同日 LaxBox／StrictBox 範例的實跑結果。這次沒有重跑這支測試，本筆記不增加驗收完成數。
+
+## 2026-11-09：TypeAdapter 整批驗證：YoubikeStations 怎麼組成、做了什麼、怎麼接進產品
+
+問題：`YoubikeStations = TypeAdapter(...)` 這一行在做什麼？已經有 `YoubikeStation`（BaseModel）的欄位了，為什麼還要它？實際要怎麼接進 `youbike.py`？
+
+結論：**`YoubikeStation` 一次只驗「一個站」，官方回傳的是「一整個 list 的站」。`TypeAdapter` 把「list、至少 1 筆、每一筆都照 `YoubikeStation` 驗」包成一個驗證器，一次呼叫就把整批驗完，錯誤會寫出第幾列、哪個欄位。** 它不是必要的：只用 BaseModel 加迴圈也行，但「批次不能空、要是 list」就得保留手寫判斷。HTML 的 E3-2 要把「非空批次、逐列 object」也集中到模型，所以建議用 TypeAdapter。
+
+現行寫法（`src/extract/youbike_model.py`，2026-11-09 存檔）：
+
+```python
+YoubikeStations = TypeAdapter(Annotated[List[YoubikeStation], Field(min_length=1)])
+```
+
+### 為什麼不能只靠 BaseModel
+
+- **整個 list 直接丟給 `YoubikeStation.model_validate`：** 不行。它只收一個 dict，收到 list 就報 `model_type`。
+- **用迴圈一列一列丟：** 可以，但整批的規則會漏掉。
+
+```python
+import sys
+
+sys.path.insert(0, ".")
+from pydantic import ValidationError
+from src.extract.youbike_model import YoubikeStation
+
+good = {"sno": "1", "sna": "model check", "sarea": "fixture", "latitude": 25.03, "longitude": 121.56, "Quantity": 6,
+        "available_rent_bikes": 2, "available_return_bikes": 4, "act": "1", "srcUpdateTime": "2023-08-01 00:00:00"}
+
+
+def loop_validate(batch):
+    return [YoubikeStation.model_validate(row) for row in batch]
+
+
+for label, batch in (("list of rows", [good]), ("empty list", []), ("one dict, no list", good)):
+    try:
+        print(f"{label:18} -> {loop_validate(batch)!r}")
+    except ValidationError as error:
+        print(f"{label:18} -> {[(e['loc'], e['type'], e['input']) for e in error.errors()]}")
+try:
+    YoubikeStation.model_validate([good])
+except ValidationError as error:
+    print(f"{'whole list at once':18} -> {[(e['loc'], e['type']) for e in error.errors()]}")
+```
+
+```text
+list of rows       -> [YoubikeStation(sno='1', sna='model check', ..., srcUpdateTime='2023-08-01 00:00:00')]
+empty list         -> []
+one dict, no list  -> [((), 'model_type', 'sno')]
+whole list at once -> [((), 'model_type')]
+```
+
+（第一行太長，中間以 `...` 省略。）
+
+- **空 list：** 迴圈一次都沒跑，回傳 `[]`、不報錯，空資料會被當成成功。
+- **不是 list 而是一個 dict：** 迴圈會去跑 dict 的 key，拿字串 `'sno'` 去驗、報 `model_type`。有擋下，但錯誤看不出真正的問題是「這不是 list」。
+
+| 做法 | 單列規則 | 「批次不能空、要是 list」 |
+|---|---|---|
+| 只用 `YoubikeStation`＋迴圈 | 模型負責 | 留著 `load_youbike` 原本的手寫判斷 |
+| 再加 `YoubikeStations`（TypeAdapter） | 模型負責 | 也由它負責，錯誤寫出第幾列 |
+
+### TypeAdapter 是什麼
+
+`BaseModel` 只能驗「有欄位的物件」；`TypeAdapter` 可以替任何型別產生驗證器，例如 list、int，或加了限制的型別。常用的兩個方法：
+
+- **`validate_python(資料)`：** 驗 Python 物件，例如 `loads(body)` 得到的 list。
+- **`validate_json(文字或 bytes)`：** 直接驗 JSON 原文，解析和驗證一起做。
+
+### 這一行怎麼組起來（由內往外）
+
+| 片段 | 意思 |
+|---|---|
+| `YoubikeStation` | 一個站的規則 |
+| `List[YoubikeStation]` | 一個 list，裡面每個元素都照上面的規則驗 |
+| `Field(min_length=1)` | 這個 list 至少要有 1 個元素 |
+| `Annotated[型別, 限制]` | 把限制貼在型別上；不在 BaseModel 類別裡，沒辦法寫 `欄位: 型別 = Field(...)`，所以用這種寫法 |
+| `TypeAdapter(...)` | 把整個型別變成驗證器；放在模組最上層，import 時建一次，之後重複使用 |
+
+`List` 和 `Annotated` 從 `typing` 匯入，Python 3.9 可以用；不要用 3.9 不支援的 `int | None` 寫法。
+
+### validate_python 依序做的事
+
+1. **確認最外層是 list：** 不是就報 `list_type`。
+2. **每個元素用 `YoubikeStation` 驗：** 不是 dict 就報 `model_type`，欄位不合規則就報對應的錯。
+3. **確認至少 1 筆：** 空的就報 `too_short`。
+4. **錯誤全部收集：** 不會遇到第一個錯就停；最後一次丟出 `ValidationError`，每個錯誤的 `loc` 是「第幾列（從 0 開始）、哪個欄位」。
+5. **全部通過：** 回傳一個 list，裡面是 `YoubikeStation` 物件；傳進去的原始 dict 不會被改動。
+
+### validate_python 回傳什麼
+
+全部通過時才有回傳值；只要有一個錯，就不回傳，直接丟 `ValidationError`。回傳值的內容：
+
+| 項目 | 內容 |
+|---|---|
+| 型別 | 一般的 Python `list` |
+| 長度與順序 | 和傳進去的 list 一樣；第幾個站就在第幾個位置 |
+| 每個元素 | 一個 `YoubikeStation` 物件，用 `.sno`、`.Quantity` 這種寫法取值 |
+| 欄位 | 只有模型宣告的 10 個；官方多給的 8 個 key（`mday`、`infoTime` 等）不會出現在物件裡 |
+| 值 | 和原始 dict 相同；只有 float 欄位收到 int 時會變成 float（`25` 變 `25.0`） |
+| 原始資料 | 回傳的是新物件，傳進去的 dict 不會被改動，還是 18 個 key |
+| 轉回 dict | `物件.model_dump()`，得到只含這 10 個欄位的 dict |
+
+```python
+"""Read-only: what validate_python returns, using one real raw body from youbike_test."""
+import sys
+from json import loads
+
+sys.path.insert(0, ".")
+import psycopg
+from config import get_env_variable
+from src.extract.youbike_model import YoubikeStations
+
+with psycopg.connect(get_env_variable("YOUBIKE_TEST_DATABASE_URL")) as conn:
+    conn.read_only = True
+    body = bytes(conn.execute("SELECT body FROM raw_bytes WHERE octet_length(body) > 100000 ORDER BY fetched_start_at DESC LIMIT 1").fetchone()[0])
+rows = loads(body)
+stations = YoubikeStations.validate_python(rows)
+
+print("type:", type(stations).__name__, "| length:", len(stations), "(input", len(rows), ")")
+print("same order:", [s.sno for s in stations[:3]] == [r["sno"] for r in rows[:3]])
+first = stations[0]
+print("element type:", type(first).__name__)
+print("attribute access:", first.sno, first.Quantity, first.srcUpdateTime)
+dumped = first.model_dump()
+print("model_dump keys:", len(dumped), list(dumped))
+print("original dict keys:", len(rows[0]), "| dropped:", sorted(set(rows[0]) - set(dumped)))
+print("values equal for the 10 fields:", all(dumped[k] == rows[0][k] for k in dumped))
+print("new objects, not the input dicts:", first is not rows[0], "| input dict unchanged:", type(rows[0]).__name__, len(rows[0]))
+
+int_lat = dict(rows[0], latitude=25)
+converted = YoubikeStations.validate_python([int_lat])[0]
+print("int latitude in:", repr(int_lat["latitude"]), "-> out:", repr(converted.latitude))
+```
+
+```text
+type: list | length: 1824 (input 1824 )
+same order: True
+element type: YoubikeStation
+attribute access: 500101001 28 2026-11-09 15:12:52
+model_dump keys: 10 ['sno', 'sna', 'sarea', 'latitude', 'longitude', 'Quantity', 'available_rent_bikes', 'available_return_bikes', 'act', 'srcUpdateTime']
+original dict keys: 18 | dropped: ['ar', 'aren', 'infoDate', 'infoTime', 'mday', 'sareaen', 'snaen', 'updateTime']
+values equal for the 10 fields: True
+new objects, not the input dicts: True | input dict unchanged: dict 18
+int latitude in: 25 -> out: 25.0
+```
+
+- **只當關卡時：** 回傳值可以不用，原本的 dict 完全沒變，照舊拿去跑 `parse_station`。
+- **改用回傳的物件時：** 取值要改成 `.sno` 這種寫法；物件裡只剩 10 個欄位，`parse_station` 用到的也正好是這 10 個，所以不會缺。
+- **正式資料的經緯度本來就是 float**，`25` 變 `25.0` 這種轉換實際上不會發生；範例是刻意把一筆改成 int 才看得到。
+
+### 範例 1：小批次
+
+`good` 是測試裡 `VALID_STATION` 那一筆，`bad_row` 是把它的 `Quantity` 改成 `-1`。
+
+```python
+import sys
+
+sys.path.insert(0, ".")
+from pydantic import ValidationError
+from src.extract.youbike_model import YoubikeStations
+
+good = {"sno": "1", "sna": "model check", "sarea": "fixture", "latitude": 25.03, "longitude": 121.56, "Quantity": 6,
+        "available_rent_bikes": 2, "available_return_bikes": 4, "act": "1", "srcUpdateTime": "2023-08-01 00:00:00"}
+bad_row = dict(good, Quantity=-1)
+
+result = YoubikeStations.validate_python([good, good])
+print("two good rows ->", type(result).__name__, len(result), type(result[0]).__name__, result[0].Quantity)
+for label, batch in (("empty list", []), ("one dict, no list", good), ("2nd row is text", [good, "x"]), ("2nd row Quantity -1", [good, bad_row])):
+    try:
+        YoubikeStations.validate_python(batch)
+        print(f"{label:20} -> accepted")
+    except ValidationError as error:
+        print(f"{label:20} -> {[(e['loc'], e['type']) for e in error.errors()]}")
+```
+
+```text
+two good rows -> list 2 YoubikeStation 6
+empty list           -> [((), 'too_short')]
+one dict, no list    -> [((), 'list_type')]
+2nd row is text      -> [((1,), 'model_type')]
+2nd row Quantity -1  -> [((1, 'Quantity'), 'greater_than_equal')]
+```
+
+| 情況 | 錯誤 | 取代 `load_youbike` 的哪個手寫判斷 |
+|---|---|---|
+| 空 list | `too_short` | `json==[]` |
+| 不是 list | `list_type` | `isinstance(json,list)==False` |
+| 某一列不是 object | `model_type`，`loc` 是第幾列 | `isinstance(row,dict)` |
+| 某一列欄位不合法 | `loc` 同時寫出第幾列、哪個欄位 | `parse_station` 裡的 `check_json` |
+
+### 範例 2：真實一批（youbike_test 裡最新的一份完整 raw）
+
+```python
+"""Read-only: run the saved YoubikeStations adapter on one real raw body from youbike_test."""
+import sys
+from json import loads
+from time import perf_counter
+from typing import List
+
+sys.path.insert(0, ".")
+import psycopg
+from pydantic import Field, TypeAdapter, ValidationError
+from typing_extensions import Annotated
+from config import get_env_variable
+from src.extract.youbike_model import YoubikeStation, YoubikeStations
+
+with psycopg.connect(get_env_variable("YOUBIKE_TEST_DATABASE_URL")) as conn:
+    conn.read_only = True
+    body = bytes(conn.execute("SELECT body FROM raw_bytes WHERE octet_length(body) > 100000 ORDER BY fetched_start_at DESC LIMIT 1").fetchone()[0])
+rows = loads(body)
+
+t = perf_counter()
+stations = YoubikeStations.validate_python(rows)
+print(f"validate_python: {len(rows)} rows -> {type(stations).__name__} of {type(stations[0]).__name__}, {1000 * (perf_counter() - t):.1f} ms")
+t = perf_counter()
+stations_json = YoubikeStations.validate_json(body)
+print(f"validate_json:   bytes -> {len(stations_json)} stations, {1000 * (perf_counter() - t):.1f} ms")
+print("first station:", stations[0].sno, stations[0].Quantity, "| original dict untouched:", type(rows[0]).__name__)
+
+two_bad = [dict(r) for r in rows]
+two_bad[3]["Quantity"] = -1
+two_bad[7]["sno"] = "   "
+try:
+    YoubikeStations.validate_python(two_bad)
+except ValidationError as error:
+    print("two bad rows ->", error.error_count(), "errors:", [(e["loc"], e["type"]) for e in error.errors()])
+
+all_bad = [dict(r, Quantity=-1) for r in rows]
+try:
+    YoubikeStations.validate_python(all_bad)
+except ValidationError as error:
+    text = str(error)
+    print("every row bad ->", error.error_count(), "errors; str(error) is", len(text), "characters; first line:", text.splitlines()[0])
+
+t = perf_counter()
+TypeAdapter(Annotated[List[YoubikeStation], Field(min_length=1)])
+print(f"building a new TypeAdapter: {1000 * (perf_counter() - t):.1f} ms")
+```
+
+```text
+validate_python: 1824 rows -> list of YoubikeStation, 4.4 ms
+validate_json:   bytes -> 1824 stations, 6.0 ms
+first station: 500101001 28 | original dict untouched: dict
+two bad rows -> 2 errors: [((3, 'Quantity'), 'greater_than_equal'), ((7, 'sno'), 'string_pattern_mismatch')]
+every row bad -> 1824 errors; str(error) is 372857 characters; first line: 1824 validation errors for list[YoubikeStation]
+building a new TypeAdapter: 0.5 ms
+```
+
+- **速度：** 1,824 站驗一次 4.4 毫秒，每 30 分鐘跑一次不用擔心。
+- **同時有兩列壞掉：** 兩個錯都列出來（第 3 列的 `Quantity`、第 7 列的 `sno`），一次就知道要修哪裡。
+- **整批都壞：** 例如官方改了格式，會有 1,824 個錯誤，`str(error)` 長達 37 萬字。
+- **建立驗證器：** 0.5 毫秒；放在最上層建一次就好。
+
+### 接進 youbike.py 時要注意的事
+
+1. **放的位置：** 在 `load_youbike` 拿到 `loads(body)` 之後、逐列處理之前，整批先驗一次。原本「空批次、不是 list、某列不是 dict」的手寫判斷可以拿掉；`parse_station` 裡那 10 行 `check_json` 也可以拿掉，之後 `parse_station` 只負責改名和時間轉換。`check_json` 函式本身先留著，`test_check_json` 還在測它。
+2. **回傳值怎麼用，二選一：**
+   - **只當關卡（改動最小）：** 驗過之後照舊拿原本的 dict 跑 `parse_station`，回傳值不用。
+   - **改用回傳的物件：** `parse_station` 要把 `row["sno"]` 這種寫法改成 `row.sno`，改動比較多。
+3. **順序不變：** raw 還是先存、先 commit，再驗證。`ValidationError` 是 `ValueError` 的子類，`extract_youbike` 的 except 照樣記 `failed` 和 `error_code` 再往外丟，Airflow 也照舊不重試。
+4. **`error_code` 可能很長（建議，不是驗收要求）：** 整批都壞時，37 萬字會整段寫進 `run_status.error_code`。存得進去，只是很肥；如果在意，可以只記 `error.error_count()` 加前幾筆 `error.errors()`。
+5. **`validate_json` 可以省掉 `loads`：** 但後面還要用 dict 跑 `parse_station`，所以用 `validate_python(loads(body))` 比較順。
+6. **存檔就上線：** `youbike.py` 存檔後下一個 :00 或 :30 就會用到。模型先寫完、測過再接；存檔挑 :01 到 :25 之間，存完馬上跑 `tests/unit`（2026-11-08 12:00–13:00 就因為存到中間版本漏掉 3 個 slot）。
+
+一句話記法：`BaseModel` 驗一個站，`TypeAdapter(List[...])` 驗一整批；錯誤的 `loc` 會告訴你第幾列、哪個欄位。
+
+核對依據：三段範例都在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）用 2026-11-09 存檔的 `youbike_model.py` 實跑；範例 2 讀 youbike_test 的 raw，只讀不寫。毫秒數是單次量測，會隨機器狀態變動。本筆記不增加驗收完成數。
+
+## 2026-11-10：sources.yml 是做什麼的，以及資料庫、schema、表三層名字
+
+問題：`sources.yml` 要幹嘛？應該寫什麼？為什麼 `schema` 寫 `public`，不是 `profiles.yml` 裡那個 schema，也不是 `youbike_test`？`raw_bytes`、`response` 對應的 schema 在哪？
+
+結論：**`sources.yml` 是一本登記簿：替資料庫裡本來就有的表取短名字。model 用短名字讀表，dbt 把它換成完整表名，並記下「這個 model 的資料從這張表來」。** 你的既有表在 `youbike_test` 資料庫的 `public` schema 裡，所以 `schema` 寫 `public`，`tables` 底下寫 `response`（要用時再加 `raw_bytes`）。
+
+### 「schema」有兩種意思
+
+| 意思 | 指什麼 | `raw_bytes` 的例子 |
+|---|---|---|
+| ① 表的結構 | 一張表有哪些欄位、什麼型別 | `sql/practice/raw_response.sql` 的 `CREATE TABLE raw_bytes (...)` |
+| ② PostgreSQL 的 schema | 資料庫裡放表的「資料夾」 | `public` |
+
+`.yml` 裡的 `schema:` 一律是意思 ②。表的結構（意思 ①）寫在 `columns:` 底下；HTML D14 的「來源 schema／型別」指的是意思 ①。這裡的「資料夾」是資料庫裡的分區，Finder 看不到。
+
+### 三層名字：資料庫.schema.表
+
+```text
+youbike_test（資料庫）
+└── public（意思②的 schema）
+    ├── raw_bytes（表）── 欄位 id、body、batch_id、fetched_start_at（意思①的結構）
+    ├── response（表）
+    └── run_status（表）
+```
+
+| 層 | 你的實際值 | 寫在哪 |
+|---|---|---|
+| 資料庫 | 測試 `youbike_test`、正式 `youbike` | `profiles.yml` 的 `dbname`（`YOUBIKE_TEST_DB_NAME`） |
+| schema | `public` | `sources.yml` 的 `schema` |
+| 表 | `response`、`raw_bytes` | `sources.yml` 的 `tables` 底下的 `name` |
+
+在測試庫實跑三種寫法：
+
+```text
+connected to: youbike_test
+schemas here: ['public']
+SELECT count(*) FROM public.response                 -> 36327 rows
+SELECT count(*) FROM youbike_test.response           -> UndefinedTable: relation "youbike_test.response" does not exist
+SELECT count(*) FROM youbike_test.public.response    -> 36327 rows
+```
+
+兩段式名字的第一段會被當成 schema；`youbike_test` 是資料庫名，不是 schema，所以第 2 種找不到表。
+
+### public 是哪來的
+
+PostgreSQL 建資料庫時就會自動建一個叫 `public` 的 schema。建表時沒寫 schema（例如 `CREATE TABLE response (...)`），表就放進 `public`。兩個資料庫實查：
+
+```text
+youbike_test: search_path = "$user", public | tables: ['public.raw_bytes', 'public.response', 'public.run_status']
+youbike: search_path = "$user", public | tables: ['public.raw_bytes', 'public.response', 'public.run_status']
+```
+
+`search_path` 是沒寫 schema 時 PostgreSQL 依序去找的地方：先找和帳號同名的 schema（沒有建），再用 `public`。所以平常寫 `response`，其實是在用 `public.response`。
+
+`sources.yml` 不寫 `schema` 時，dbt 不會用這個預設，而是把來源的 `name` 當成 schema 名（例如取名 `youbike`，就會去找 `youbike.response`，找不到）。所以要明確寫 `schema: public`。來源的 `name` 只是自己取的標籤，和資料庫名無關；怕和 `youbike` 資料庫混淆，可以取 `raw` 之類的名字。
+
+### 範例：有沒有登記的差別（商店訂單，獨立小專案）
+
+```yaml
+# models/sources.yml
+sources:
+  - name: shop          # 分類名，自己取
+    schema: public      # 表在哪個 schema（資料夾）
+    tables:
+      - name: orders    # 表的真名
+```
+
+```sql
+-- models/stg_orders.sql
+select * from {{ source('shop', 'orders') }}
+```
+
+```text
+-- 拿掉 sources.yml 時
+Compilation Error
+Model 'model.no_version_demo.stg_orders' (models/stg_orders.sql) depends on a source named 'shop.orders' which was not found
+-- 放回 sources.yml，dbt compile 的結果
+select * from "none"."public"."orders"
+```
+
+`"none"` 是範例 profile 填的資料庫名，`"public"` 來自 `sources.yml` 的 `schema`，`"orders"` 來自 `tables`。換成你的專案，連測試庫時會編譯成 `"youbike_test"."public"."response"`。
+
+跑 dbt 時：先讀所有 `.yml` 建好登記簿；讀到 `{{ source(...) }}` 時查登記簿換成完整表名；同時記下依賴，所以 `dbt ls --select +模型` 能一路列到 `source:...`，這就是 lineage。直接在 SQL 寫 `public.response` 也能跑，但 lineage 會斷在 staging，之後的新鮮度檢查也是掛在 source 上，表改名時還得每個 model 都改。
+
+### profiles.yml 的 schema 和 sources.yml 的 schema
+
+| 寫在哪 | 意思 | 方向 |
+|---|---|---|
+| `profiles.yml` 的 `schema` | dbt 把自己建的 staging、mart 放在哪 | 寫出去 |
+| `sources.yml` 的 `schema` | 要讀的既有表放在哪 | 讀進來 |
+
+圖書館範例裡 `profiles.yml` 寫 `demo_library`、`sources.yml` 寫 `demo_library_src`，dbt 從 `demo_library_src.loans` 讀，建出來的放進 `demo_library`：
+
+```text
+OK created sql view model demo_library.stg_loans
+```
+
+要分開的原因：dbt 每次會砍掉重建自己的 model；和原始表放在同一個 schema，萬一 model 和原始表撞名，原始資料會被蓋掉。`profiles.yml` 的 schema 取新名字（例如 `analytics`），不存在 dbt 會自己建。
+
+### 為什麼先接測試庫
+
+任務 3 在開發：會反覆建、砍、重建 view 或表，正反測試要故意放不合格資料，寫錯的 SQL 也可能掃整張大表。正式庫每 30 分鐘就有 Airflow 寫入，而且在 USB 2.0 的硬碟上；測試庫帳號已確認能建 schema，正式庫權限還沒開；dbt 接 DAG 和正式庫排在任務 5（D20）。測試庫的 `response` 有 36,327 列，夠開發；其中有測試留下的未來時間 slot（例如 2098、2099 年），算小時資料時看到是正常的。
+
+### version: 2
+
+`.yml` 開頭的 `version: 2` 是 dbt 這類設定檔的格式版本，不是專案版本（專案版本是 `dbt_project.yml` 的 `version: "1.0"`）。官方文件說 dbt 1.5 起可以省略；用 dbt 1.12.6 實測，沒寫 `version: 2` 的 `sources.yml` 照樣能讀：
+
+```text
+no_version_demo.stg_orders
+source:no_version_demo.shop.orders
+```
+
+### 你的 sources.yml 要寫什麼
+
+- `sources` 底下的 `name`：分類名，自己取。
+- `schema`：`public`。
+- `tables` 底下每張表一個 `- name:`：`response`；要用 `raw_bytes` 時再加。
+- `columns`：想記錄表的結構就加，照 `CREATE TABLE` 寫欄位與 `data_type`；只是紀錄，不會擋錯（source 不能用 contract）。
+- source tests：不用加。`response` 的 NOT NULL、站點＋採樣時間不重複、數量不為負、`station_active` 只能 0／1 都已經由資料庫約束（D3）擋住，在 dbt 再驗一次抓不到新的錯；正反測試放在 staging。
+
+一句話記法：`.yml` 的 `schema` 是資料夾，`public` 就是你既有表所在的資料夾；資料庫名交給 `profiles.yml`，表名寫在 `tables` 底下。
+
+核對依據：2026-11-10 在本機 Youbike/.venv（Python 3.9.6）連 youbike_test 與 youbike 唯讀實查；商店範例用 Youbike/.venv-dbt 的 dbt-core 1.12.6 實跑（只 parse／compile，不連資料庫建東西）；圖書館範例是 2026-11-09 在 youbike_test 另開 schema 實跑、跑完已刪除。本筆記不增加驗收完成數。
