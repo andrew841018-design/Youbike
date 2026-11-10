@@ -1977,3 +1977,62 @@ source:no_version_demo.shop.orders
 一句話記法：`.yml` 的 `schema` 是資料夾，`public` 就是你既有表所在的資料夾；資料庫名交給 `profiles.yml`，表名寫在 `tables` 底下。
 
 核對依據：2026-11-10 在本機 Youbike/.venv（Python 3.9.6）連 youbike_test 與 youbike 唯讀實查；商店範例用 Youbike/.venv-dbt 的 dbt-core 1.12.6 實跑（只 parse／compile，不連資料庫建東西）；圖書館範例是 2026-11-09 在 youbike_test 另開 schema 實跑、跑完已刪除。本筆記不增加驗收完成數。
+
+## 2026-11-10：Pydantic alias：API 的名字只留在模型，程式一律用資料庫的名字
+
+問題：`youbike_model.py` 裡加的 `alias` 是做什麼的？
+
+結論：**`alias` 是「這個欄位在輸入資料裡叫什麼名字」。** 官方 API 的欄位名改不了（`sno`、`sna`、`Quantity`、`act`、`srcUpdateTime`），但程式和資料庫想用同一套名字。把對照寫成 `Field(alias="sno")`，讀資料時去 JSON 找 `"sno"`，讀進來之後一律用 `station.station_id`。API 的名字只出現在模型這一個地方，`parse_station`、`load_youbike` 都不再看到它們。
+
+### YouBike 的對照
+
+| 官方 JSON（alias） | 程式與資料庫 |
+|---|---|
+| `sno` | `station_id` |
+| `sna` | `station_name` |
+| `sarea` | `station_area` |
+| `Quantity` | `quantity` |
+| `act` | `station_active` |
+| `srcUpdateTime` | `source_update_time` |
+| `latitude`、`longitude`、`available_rent_bikes`、`available_return_bikes` | 兩邊同名，不用 alias |
+
+### 範例：氣象資料的 tmp、stn
+
+```python
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class Reading(BaseModel):
+    model_config = ConfigDict(strict=True)
+    temperature: float = Field(alias="tmp")
+    station_code: str = Field(alias="stn")
+
+r = Reading.model_validate({"tmp": 21.5, "stn": "A01", "extra": 1})
+print(r.temperature, r.station_code)
+print(r.model_dump())
+print(r.model_dump(by_alias=True))
+try:
+    Reading.model_validate({"temperature": 21.5, "station_code": "A01"})
+except ValidationError as e:
+    print([(x["loc"], x["type"]) for x in e.errors()])
+```
+
+```text
+21.5 A01
+{'temperature': 21.5, 'station_code': 'A01'}
+{'tmp': 21.5, 'stn': 'A01'}
+[(('tmp',), 'missing'), (('stn',), 'missing')]
+```
+
+- **第 1 行：** 輸入用 `tmp`、`stn`，讀進來後用 `r.temperature`、`r.station_code` 取值；多出來的 `extra` 預設忽略。
+- **第 2、3 行：** 轉回 dict 時預設用程式裡的名字；加 `by_alias=True` 就換回原始名字。
+- **第 4 行：** 直接拿程式名字當輸入會被當成缺欄位。輸入一定要用 alias 的名字，錯誤訊息也用 alias 指出是哪一欄。
+
+### 注意
+
+1. **規則不受影響：** `strict=True`、`pattern=r"\S"`（不能空白）、`ge=0`（不能負數）照樣作用在欄位上，加 alias 只改「去哪裡找值」和「之後叫什麼」。
+2. **測試資料照舊用 API 名字：** `test_station_model_quantity` 的 `VALID_STATION` 還是寫 `Quantity`，因為它模擬的是官方 JSON。
+3. **和命名統一同一個原則：** 同一個值在程式、資料庫、dbt 只用一個名字；外部來源的名字改不了，就在進門的地方（模型）對照一次。
+
+一句話記法：`Field(alias="外面的名字")`，外面怎麼叫都只寫在模型，裡面一律用自己的名字。
+
+核對依據：範例在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）實跑。專案的模型在 2026-11-10 命名統一時改成 alias 寫法，`tests/unit` 同半小時連跑兩次 16 passed，16:00、16:30 正式擷取都 succeeded。本筆記不增加驗收完成數。
