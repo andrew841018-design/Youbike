@@ -1,0 +1,4 @@
+name: youbike
+version: '1.0'
+profile: youbike
+model-paths: ["models"]

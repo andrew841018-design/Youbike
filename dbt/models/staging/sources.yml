@@ -1,0 +1,27 @@
+sources:
+  - name: youbike
+    schema: public
+    tables:
+      - name: raw_bytes
+        columns:
+          - name: id
+          - name: body
+          - name: batch_id
+          - name: slot_time
+      - name: response
+        columns:
+          - name: id
+          - name: batch_id
+          - name: station_id
+          - name: station_name
+          - name: station_area
+          - name: latitude
+          - name: longitude
+          - name: quantity
+          - name: available_rent_bikes
+          - name: available_return_bikes
+          - name: station_active
+          - name: source_update_time
+          - name: slot_time
+          - name: ingested_at
+          

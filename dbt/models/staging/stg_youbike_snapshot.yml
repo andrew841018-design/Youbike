@@ -1,0 +1,31 @@
+models:
+  - name: stg_youbike_snapshot
+    description: "Staging model for Youbike snapshot data"
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: station_id
+        data_type: text
+      - name: slot_time
+        data_type: timestamptz
+      - name: available_rent_bikes
+        data_type: integer
+      - name: available_return_bikes
+        data_type: integer
+      - name: quantity
+        data_type: integer
+      - name: station_name
+        data_type: string
+      - name: station_area
+        data_type: string
+      - name: latitude
+        data_type: float
+      - name: longitude
+        data_type: float
+      - name: batch_id
+        data_type: uuid
+      - name: station_active
+        data_type: text
+      - name: ingested_at
+        data_type: timestamptz

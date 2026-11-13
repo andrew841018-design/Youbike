@@ -1,0 +1,13 @@
+youbike:
+  target: test
+  outputs:
+    test:
+      type: postgres
+      threads: 1
+      host: "{{ env_var('YOUBIKE_TEST_DATABASE_HOST') }}"
+      port: "{{ env_var('YOUBIKE_TEST_DATABASE_PORT') | int }}"
+      user: "{{ env_var('YOUBIKE_TEST_DATABASE_USER') }}"
+      password: "{{ env_var('YOUBIKE_TEST_DATABASE_PASSWORD') }}"
+      dbname: "{{ env_var('YOUBIKE_TEST_DATABASE_NAME') }}"
+      schema: dbt
+      threads: 1

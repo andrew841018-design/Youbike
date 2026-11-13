@@ -1,0 +1,23 @@
+models:
+  - name: mart_station_hourly
+    description: "Mart model for Youbike hourly availability data"
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: station_id
+        data_type: text
+      - name: slot_hour
+        data_type: timestamptz
+      - name: min_rent_bikes
+        data_type: integer
+      - name: max_rent_bikes
+        data_type: integer
+      - name: avg_rent_bikes
+        data_type: float
+      - name: min_return_bikes
+        data_type: integer
+      - name: max_return_bikes
+        data_type: integer
+      - name: avg_return_bikes
+        data_type: float
