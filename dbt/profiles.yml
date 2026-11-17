@@ -10,4 +10,3 @@ youbike:
       password: "{{ env_var('YOUBIKE_TEST_DATABASE_PASSWORD') }}"
       dbname: "{{ env_var('YOUBIKE_TEST_DATABASE_NAME') }}"
       schema: dbt
-      threads: 1

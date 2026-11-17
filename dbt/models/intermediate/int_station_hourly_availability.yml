@@ -1,5 +1,11 @@
 models:
   - name: int_station_hourly_availability
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - station_id
+              - slot_hour
     description: "Intermediate model for Youbike hourly availability data"
     config:
       contract:
