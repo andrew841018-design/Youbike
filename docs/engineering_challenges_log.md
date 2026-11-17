@@ -1974,7 +1974,9 @@ same object: False
 - 讀表：原始表用 `{{ source('群組名', '表名') }}`，在 `sources.yml` 登記，`schema: public` 要明寫；dbt 自己建的 model 用 `{{ ref('檔名') }}`。`{{ }}` 讓 dbt 記下誰讀誰，才能擋壞資料、排順序、只跑受影響的部分、畫 lineage。
 - 名字三層：資料庫（`profiles.yml` 的 `dbname`）→ schema（原始表在 `public`，model 放 `profiles.yml` 寫的 `dbt`）→ 表。schema 有兩個意思：表的結構，或資料庫裡的資料夾；設定檔裡的 `schema:` 一律是資料夾。
 - 分層看用途：staging 清理每張來源表，是翻譯層；intermediate 是可重用的零件；mart 依需求組出給人用的表。需求來了先用零件組 mart，組不出來才補零件。
-- view 存的是查詢，不是資料；要像快取一樣存結果用 `materialized='table'`，任務 4 的 incremental 是只把新資料加進表。
+- 沒寫 `materialized` 時，dbt 預設把 model 建成 view；view 存的是查詢，不是資料：每次有人查才重跑 SELECT，所以永遠是最新、但每次都重算。table 在 dbt build 時跑一次 SELECT、存下那一刻的結果，查詢快，但要重新 build 才看得到新資料。`materialized` 只決定 model 自己被建成什麼（view、table、incremental 第一次建表、ephemeral 不建），從哪裡讀看 `FROM` 裡的 `ref()`／`source()`。要像快取一樣存結果用 `materialized='table'`。incremental 第一次跑等於 table，之後每次只把 SELECT 選出的列寫進原表：沒有 `unique_key` 就直接附加，有 `unique_key` 加 delete+insert 就先刪同 key 再插入；選哪些列由 `is_incremental()` 裡的篩選決定，沒篩會重複寫入。
+- watermark 是記錄「資料處理到哪裡」的值：用只會隨新資料變大的欄位（YouBike 用 `ingested_at`），處理完存下來、下次當起點，處理完再往後移。YouBike 的 mart 用 `(select max(last_ingested_at) from {{this}})` 每次現算，不是另一張表；`slot_time` 會因為晚到資料而比上次的值小，不能當 watermark。
+- 增量找新資料看寫入時間（`ingested_at` 或已處理批次清單），不看 `slot_time`：dbt 已經算過較新的 slot 之後，舊 slot 的資料才寫進來（手動重跑、補跑），用 `slot_time` 篩會永遠漏掉，而且不會報錯。選到新資料後，用它的 `slot_time` 決定屬於哪個小時，用那個小時全部的樣本重算，再靠 key（站點＋小時）delete+insert 換掉舊列，所以舊的小時也會被更新。
 - 檢查三種：unit test（建之前，驗 SQL 邏輯）、contract（建的當下，驗欄位名稱與型別）、data test（建之後，驗真實資料）。檢查放在會出錯的那層；失敗會擋下游，但不刪資料。
 - 目前的決定：`coverage` 與 `sample_count` 於 2026-11-13 拿掉（漏抓看 `run_status`）；mart 用 `ref` 讀 intermediate、不重算；新鮮度要不要放 mart 待 Andrew 決定。
 
@@ -2684,3 +2686,334 @@ given:
 一句話記法：看到「這裡可能有好幾個」的地方就用 `-` 開頭，只有一個也一樣。
 
 核對依據：兩種寫法的讀法用 `.venv-dbt` 的 PyYAML 實跑；少了 `-` 的錯誤訊息是 2026-11-13 在暫存範例專案跑 `dbt parse` 得到的（dbt 1.12.6），跑完已還原。本筆記不增加驗收完成數。
+
+### 2026-11-17：dbt 預設把 model 建成 view；materialized 決定建出什麼
+
+model 的 `.sql` 檔裡只寫 `SELECT`。「把結果存成什麼」的那句 SQL 是 dbt 自己包在外面的；沒寫 `config(materialized=...)` 時，預設建成 **view**。
+
+例如 `mart_station_hourly.sql` 只寫了 `Select ... from int`，2026-11-17 build 時 dbt 實際送出的 SQL（在 `dbt/target/run/` 裡）是：
+
+```text
+create view "youbike_test"."dbt"."mart_station_hourly__dbt_tmp"
+as (
+  Select station_id,slot_hour,max_rent_bikes, ...
+from "youbike_test"."dbt"."int_station_hourly_availability"
+);
+```
+
+`create view ... as (` 是 dbt 加的；`__dbt_tmp` 是暫時名字，建好後 dbt 會改回 `mart_station_hourly`。
+
+`materialized` 只管這個 model **自己被建成什麼**。它從哪裡讀資料，看的是 `FROM` 裡的 `ref()`／`source()`，跟 `materialized` 無關。同一段 `select 'apple' as name, 3 as qty`，四種值實跑的結果：
+
+| `materialized` | dbt 送出的 SQL | Postgres 裡出現的東西 |
+|---|---|---|
+| 不寫（預設 view） | `create view ...` | `VIEW` |
+| `'table'` | `create table ...` | `BASE TABLE` |
+| `'incremental'`（第一次跑） | `create table ...` | `BASE TABLE` |
+| `'ephemeral'` | 不送任何 SQL | 什麼都沒有 |
+
+- **view：** 資料庫只存那段 SELECT 的文字，有人查它時才當下重跑。
+- **table、incremental：** 存的是跑出來的每一列資料。第一次跑兩者看起來一樣，差別在之後再跑的時候（任務 4）。
+- **ephemeral：** 不在資料庫建任何東西；下游 model 用到它時，dbt 把它的 SELECT 直接嵌進下游的 SQL。
+
+核對依據：mart 的 SQL 讀自 2026-11-17 15:53 build 留下的 `dbt/target/run/youbike/models/marts/mart_station_hourly.sql`；四種值在測試庫的暫存專案實跑（dbt 1.12.6），Postgres 類型查自 `information_schema.tables`，跑完已刪除。ephemeral 嵌進下游是 dbt 的既定行為，這次沒有另外實跑下游。本筆記不增加驗收完成數。
+
+### 2026-11-17：view 和 table 怎麼運作、差在哪
+
+| | view | table |
+|---|---|---|
+| 資料庫裡存什麼 | 只存那段 SELECT 的文字 | SELECT 跑出來的每一列資料 |
+| SELECT 什麼時候跑 | 每次有人查它的時候 | dbt build 的時候跑一次 |
+| 來源有新資料時 | 下次查詢就看得到 | 看不到，要重新 build 才會更新 |
+| 查詢的成本 | 每次都從來源重算一遍，資料越多越慢 | 直接讀存好的列，很快 |
+| build 的成本 | 只存文字，很快，跟資料量無關 | 要把整段 SELECT 跑完，資料越多越慢 |
+| 佔用空間 | 幾乎不佔 | 每一列都存在磁碟上 |
+
+**實測：** 兩個 model 的 SELECT 完全一樣，只差 table 那個檔案第一行多了 `{{ config(materialized='table') }}`：
+
+```sql
+select shop, sum(amount) as total
+from {{ source('demo', 'sales') }}
+group by shop
+```
+
+來源表 `sales` 先放兩筆（100、50），接著依序操作：
+
+```text
+## 1. dbt run (sales: 100, 50)
+   1 of 2 OK created sql table model demo_vt.shop_total_table .. [SELECT 1 in 0.13s]
+   2 of 2 OK created sql view model demo_vt.shop_total_view .. [CREATE VIEW in 0.05s]
+## 2. query both
+    view | A | 150
+    table | A | 150
+## 3. insert 30 into sales, no dbt run, query both
+    view | A | 180
+    table | A | 150
+## 4. EXPLAIN (what Postgres does when you query each)
+  -- view:
+    HashAggregate  (cost=29.05..31.05 rows=200 width=40)
+      Group Key: sales.shop
+      ->  Seq Scan on sales  (cost=0.00..22.70 rows=1270 width=36)
+  -- table:
+    Seq Scan on shop_total_table  (cost=0.00..22.00 rows=1200 width=40)
+## 5. dbt run again, query both
+    view | A | 180
+    table | A | 180
+## 6. what is stored
+    shop_total_view |  SELECT shop, sum(amount) AS total FROM demo_vt.sales GROUP BY shop;
+    sales | 3
+    shop_total_table | 1
+```
+
+- **第 3 步：** 來源多了 30，沒有重跑 dbt。view 馬上變成 180，table 還停在 150，因為 table 存的是上次 build 那一刻的結果。
+- **第 4 步：** 查 view 時，Postgres 實際上是去掃 `sales` 再分組加總（`HashAggregate`、`Seq Scan on sales`），也就是把 SELECT 重跑一遍；查 table 只是把存好的列讀出來（`Seq Scan on shop_total_table`）。
+- **第 5 步：** 再跑一次 dbt，table 重新跑了整段 SELECT（`SELECT 1` 表示寫入 1 列），這時才變成 180。
+- **第 6 步：** view 在資料庫裡只有一段定義文字；table 真的存了 1 列資料。
+
+**放回 YouBike：** 目前 staging、int、mart 都是 view，所以每查一次 mart，Postgres 都要從 `response` 的全部列重新分組計算。好處是重播寫進來的資料，下次查詢就看得到；壞處是 `response` 每 30 分鐘就多一批，查詢會越來越慢。任務 4 把 mart 改成表（增量），就是為了不用每次重算；代價是表要重新 build 才會更新。
+
+**怎麼選：** 業界常見的做法是，輕量的整理層（例如 staging）用 view；會被頻繁查詢、計算又重的 mart 存成 table 或 incremental。
+
+核對依據：上面的輸出是 2026-11-17 在測試庫的暫存專案實跑（dbt 1.12.6）；查詢計畫用 `EXPLAIN`，儲存內容查自 `pg_views` 與 `pg_stat_user_tables`，跑完已刪除。第 6 步的 view 定義原本分成四行，這裡合成一行。本筆記不增加驗收完成數。
+
+### 2026-11-17：incremental 怎麼運作：第一次建表，之後只寫進 SELECT 選出來的列
+
+**一句話：** incremental 第一次跑和 table 一樣，`create table ... as (SELECT)`；之後每次跑都**不重建表**，而是先把 SELECT 的結果放進暫存表（`__dbt_tmp...`），再照設定的方式寫進原本的表。**哪些列算新的，dbt 不會自己判斷，完全由你寫的 SELECT 決定。**
+
+| 名稱 | 作用 |
+|---|---|
+| `materialized='incremental'` | 第一次建表，之後只寫入 SELECT 選出的列 |
+| `is_incremental()` | 表已經存在、而且這次不是 `--full-refresh` 時才是 true；寫在 `{% if is_incremental() %}` 裡的篩選，第一次跑時不會出現 |
+| `{{ this }}` | 這個 model 自己目前那張表，常用來讀「上次處理到哪」 |
+| 沒有 `unique_key` | 直接把選出的列附加到表的最後（insert） |
+| `unique_key` 加 `incremental_strategy='delete+insert'` | 先刪掉表裡 key 相同的舊列，再插入新算的列 |
+| `dbt run --full-refresh` | 不管增量，整張表刪掉重建 |
+
+**實測：** 三個 model 都讀同一張來源表 `events`，差別只在篩選和 key。
+
+```sql
+-- inc_plain：沒有篩選，也沒有 unique_key
+{{ config(materialized='incremental') }}
+select shop, amount, loaded_at from {{ source('demo', 'events') }}
+
+-- inc_filtered：只選比上次更晚寫入的列
+{{ config(materialized='incremental') }}
+select shop, amount, loaded_at from {{ source('demo', 'events') }}
+{% if is_incremental() %}
+where loaded_at > (select max(loaded_at) from {{ this }})
+{% endif %}
+
+-- inc_keyed：每家店一列總額；找出有新資料的店，用它全部的資料重算，再換掉舊列
+{{ config(materialized='incremental', unique_key='shop', incremental_strategy='delete+insert') }}
+with changed as (
+    select distinct shop from {{ source('demo', 'events') }}
+    {% if is_incremental() %}
+    where loaded_at > (select max(last_loaded_at) from {{ this }})
+    {% endif %}
+)
+select e.shop, sum(e.amount) as total, max(e.loaded_at) as last_loaded_at
+from {{ source('demo', 'events') }} e
+join changed c on c.shop = e.shop
+group by e.shop
+```
+
+`events` 一開始有兩筆（A 100、B 70），之後加一筆 A 30：
+
+```text
+## run 1 (events: A 100, B 70)
+   1 of 3 OK created sql incremental model demo_inc.inc_filtered .. [SELECT 2]
+   2 of 3 OK created sql incremental model demo_inc.inc_keyed .. [SELECT 2]
+   3 of 3 OK created sql incremental model demo_inc.inc_plain .. [SELECT 2]
+   SQL sent for inc_keyed:
+      create  table "youbike_test"."demo_inc"."inc_keyed"
+      as
+      (
+      with changed as (
+      select distinct shop from "youbike_test"."demo_inc"."events"
+      )
+      ...
+## run 2 (new event: A 30)
+   1 of 3 OK created sql incremental model demo_inc.inc_filtered .. [INSERT 0 1]
+   2 of 3 OK created sql incremental model demo_inc.inc_keyed .. [INSERT 0 1]
+   3 of 3 OK created sql incremental model demo_inc.inc_plain .. [INSERT 0 3]
+    inc_plain | 5
+    inc_filtered | 3
+    inc_keyed | 2
+   SQL sent for inc_filtered:
+      insert into "youbike_test"."demo_inc"."inc_filtered" ("shop", "amount", "loaded_at")
+      (
+      select "shop", "amount", "loaded_at"
+      from "inc_filtered__dbt_tmp172002278415"
+      )
+   SQL sent for inc_keyed:
+      delete from "youbike_test"."demo_inc"."inc_keyed" as DBT_INTERNAL_DEST
+      where (shop) in (
+      select distinct shop
+      from "inc_keyed__dbt_tmp172002415755" as DBT_INTERNAL_SOURCE
+      );
+      insert into "youbike_test"."demo_inc"."inc_keyed" ("shop", "total", "last_loaded_at")
+      (
+      select "shop", "total", "last_loaded_at"
+      from "inc_keyed__dbt_tmp172002415755"
+      )
+   inc_keyed rows:
+    A | 130 | 2026-11-02 09:00:00+08:00
+    B | 70 | 2026-11-01 10:00:00+08:00
+## run 3 (nothing new)
+   1 of 3 OK created sql incremental model demo_inc.inc_filtered .. [INSERT 0 0]
+   2 of 3 OK created sql incremental model demo_inc.inc_keyed .. [INSERT 0 0]
+   3 of 3 OK created sql incremental model demo_inc.inc_plain .. [INSERT 0 3]
+    inc_plain | 8
+    inc_filtered | 3
+    inc_keyed | 2
+   inc_plain rows:
+    A | 30 | 2
+    A | 100 | 3
+    B | 70 | 3
+## run 4: --full-refresh on inc_plain
+   1 of 1 OK created sql incremental model demo_inc.inc_plain .. [SELECT 3]
+    inc_plain | 3
+```
+
+- **run 1：** 三個都是第一次，dbt 送的是 `create table ... as`，和 table 一樣；`is_incremental()` 是 false，所以 inc_keyed 的 SQL 裡沒有那段 `where`。
+- **inc_plain：** 沒有篩選，每次都把 `events` 全部三列再附加一次：run 2 變 5 列、run 3 變 8 列，A 100 已經重複 3 次。incremental 只會照 SELECT 的結果寫入，SELECT 沒篩，就會一直重複。
+- **inc_filtered：** 有篩選，run 2 只選到新的 A 30（`INSERT 0 1`），run 3 沒有新資料（`INSERT 0 0`）。dbt 送的是單純的 `insert into ... select ... from 暫存表`。
+- **inc_keyed：** run 2 只有 A 有新資料，A 用它全部的資料重算成 130；dbt 先 `delete ... where (shop) in (暫存表裡的 shop)`，再 `insert`，所以 A 被換掉、B 沒動，表還是 2 列。
+- **run 4：** `--full-refresh` 把 inc_plain 整張重建，從 8 列回到正確的 3 列。
+
+**三種比較：**
+
+| | view | table | incremental |
+|---|---|---|---|
+| 每次 build 做什麼 | 只存 SELECT 文字 | 整段 SELECT 重跑，整張表重建 | 只跑 SELECT 選出的部分，寫進原表 |
+| 每次 build 處理多少資料 | 不處理 | 全部 | 只有新的（看你的篩選） |
+| 要自己負責的事 | 無 | 無 | 篩出新資料、決定怎麼寫入（附加或換掉） |
+
+**另外兩個實測過的限制（2026-11-17）：**
+- model 開了 contract 又改成 incremental，一定要在 config 加 `on_schema_change: fail`（或 `append_new_columns`），不然整個 dbt 都跑不起來：「Models materialized as incremental with contracts enabled must set on_schema_change to 'append_new_columns' or 'fail'」。
+- unit test 用到 `input: this` 時，資料庫裡要先有這張表，不然會報「Not able to get columns … because the relation doesn't exist」；第一次先 `dbt run --select` 建表再測。
+
+**放回 YouBike：** 任務 4 要把 mart 改成 incremental，用的是 inc_keyed 這一類：用 `ingested_at`（或批次清單）篩出新資料，key 是站點＋小時，用 delete+insert 換掉受影響的那幾組。
+
+核對依據：上面的輸出是 2026-11-17 在測試庫的暫存專案實跑（dbt 1.12.6），跑完已刪除；log 的執行秒數已拿掉，run 1 的 SQL 只節錄開頭。兩個限制的錯誤訊息出自同日另一個暫存專案的實跑。本筆記不增加驗收完成數。
+
+### 2026-11-17：watermark 是什麼：記錄「資料處理到哪裡」的那條線
+
+#### 定義
+
+watermark（水位線）是一個記錄「資料已經處理到哪裡」的值，用來劃分「處理過」和「還沒處理」的資料。下一次執行只處理超過這條線的資料，處理完再把線往後移。名字來自河岸或船身上標示「水曾經漲到這裡」的那條線：只會往上移，不會往回退。
+
+#### 三個要點，對照 YouBike 的 mart
+
+| 要點 | 在 YouBike（Andrew 2026-11-17 存檔） |
+|---|---|
+| 要用「只會隨新資料變大」的欄位 | `ingested_at`：資料越晚寫入，值越大 |
+| 處理完要記下來，下次拿來當起點 | int 第 4 行 `max(ingested_at) as last_ingested_at`：每個站點小時記下最新一筆樣本的寫入時間；mart 第 7 行把它存進表；mart 第 11 行 `(select max(last_ingested_at) from {{this}})` 取出最大的那個，這就是 watermark |
+| 只會往後移 | 處理過新批次後，mart 裡最大的 `last_ingested_at` 跟著變大 |
+
+watermark 不是另外一張表，也不是存在別處的變數，而是每次執行時才從 mart 表裡算出來；mart 一更新，下一次算出來的值就跟著往後移。
+
+#### 實際的值
+
+2026-11-17 在 youbike_test 查到：
+
+```text
+mart rows / watermark: (54643, datetime.datetime(2026, 11, 11, 15, 49, 15, 419377, tzinfo=zoneinfo.ZoneInfo(key='Asia/Taipei')))
+hours a run would touch: 1
+```
+
+所以下一次增量只會從 int 挑出 `last_ingested_at >= 2026-11-11 15:49:15` 的小時，當時只有 1 個。
+
+| 時間點 | watermark（mart 裡最大的 `last_ingested_at`） | 下一次會處理 |
+|---|---|---|
+| 查詢當時 | 2026-11-11 15:49:15 | `last_ingested_at` ≥ 15:49:15 的小時 |
+| 某個新批次在時間 T 寫入，再跑一次之後 | T | `last_ingested_at` ≥ T 的小時 |
+
+晚到資料的例子（同日在 scratchpad 副本模擬）：替站點 00123 最舊的小時（09/27 08:00）補一筆晚到的樣本，它的 `ingested_at` 是當下時間，比 watermark 新，所以下一次 build 選到了這個小時：log 是 `INSERT 0 2`，這個小時從 max 7、avg 7 重算成 max 17、avg 12，`last_ingested_at` 從 10/24 變成 11/17 19:55。
+
+#### 為什麼 `slot_time` 不能當 watermark
+
+晚到的資料 `slot_time` 比較舊。例如 09:30 的資料，在 dbt 已經處理到 10:00 之後才寫進 `response`。如果用「`slot_time` 大於上次的最大值」來篩，09:30 永遠比 10:00 小，會一直被篩掉；mart 那個小時永遠少一筆，而且 `dbt build` 照樣全過、不會報錯。`ingested_at` 記的是寫入時間，晚到的資料寫入時間反而比較新，所以篩得到。
+
+#### 容易搞混：串流系統的 watermark
+
+Spark、Flink 這類串流系統裡的 watermark 是另一個意思：指「等晚到資料最多等到哪個時間點」，過了就不再等。YouBike 現在用的是批次處理的這一種。
+
+核對依據：定義與對照整理自 2026-11-17 D16 問答；watermark 的值是同日在 youbike_test 實際查到的；晚到樣本是助理在 scratchpad 副本的一次性模擬，跑完已刪除，沒有改 Andrew 的檔案。本筆記不增加驗收完成數。
+
+### 2026-11-17：D16 增量要用寫入時間找新資料，不能用 slot_time；舊的小時一樣會被更新
+
+**一句話：** `ingested_at`（或已處理批次清單）決定「哪些資料是新的」，`slot_time` 決定「新資料屬於哪個小時」。incremental 本身怎麼運作、watermark 是什麼，見同日前兩則（「incremental 怎麼運作」與「watermark 是什麼」）。
+
+#### 兩個時間欄位
+
+| 欄位 | 意思 | 用在哪一步 |
+|---|---|---|
+| `slot_time` | 這筆資料描述的是哪一次採樣的車況 | 決定它屬於哪個小時 |
+| `ingested_at` | 這筆資料什麼時候寫進 `response` | 決定它算不算新資料 |
+
+#### 為什麼不能用「`slot_time` 大於上次的最大值」
+
+- **問題不在擷取層：** 重播（D11）把 09:30 的資料寫進 `response`，這一步是對的。問題在 dbt 層：增量 model 每次都要判斷 `response` 裡哪些列還沒算進 mart。
+- **會不會出錯，要看順序：**
+
+| 順序 | 用 `slot_time` 篩 | 用 `ingested_at` 篩 |
+|---|---|---|
+| ① 09:30 重播完成 → 10:00 寫入 → dbt 才跑 | dbt 上次只算到 09:00，兩批都比 09:00 新，抓得到 | 抓得到 |
+| ② 10:00 寫入 → dbt 跑（mart 記到 10:00）→ 09:30 才寫入 → dbt 再跑 | 09:30 比 10:00 舊，永遠抓不到 | 09:30 是上次 dbt 之後才寫入的，抓得到 |
+
+- **順序②什麼時候發生：** 在 Airflow 手動重跑過去的那一次，或補跑以前漏掉的 slot。篩選規則不能靠順序剛好是①才正確。
+- **漏掉的後果：** `response` 的資料是完整的，int view（全量重算）也是對的，只有 mart 錯。錯法有兩種：那個小時只用部分樣本算，值是錯的；或整個小時都晚到，mart 根本沒有那一列。`dbt build` 照樣全過、不會報錯，之後也不會自己補上。
+
+實測：三筆資料，最後一筆是 09:30 的採樣、10:20:05 才寫入；上次處理到 `slot_time` 10:00、`ingested_at` 10:00:40。
+
+```sql
+with response(station_id, slot_time, ingested_at, bikes) as (values
+  ('X', time '09:00', time '09:00:40', 3),
+  ('X', time '10:00', time '10:00:40', 5),
+  ('X', time '09:30', time '10:20:05', 6)
+)
+select 'A: slot_time > 10:00' as rule, slot_time, ingested_at, bikes
+from response where slot_time > time '10:00'
+union all
+select 'B: ingested_at > 10:00:40', slot_time, ingested_at, bikes
+from response where ingested_at > time '10:00:40'
+```
+
+```text
+rows returned: 1
+('B: ingested_at > 10:00:40', '09:30:00', '10:20:05', '6')
+```
+
+A 一筆都沒選到，只有 B 選到晚到的那筆。
+
+#### 舊的小時也會被更新：用整個小時重算，靠 key 換掉
+
+用 `ingested_at` 選到晚到的 09:30 那筆之後：
+
+1. **算出它屬於哪個小時：** 用它的 `slot_time` 算，屬於站點 X 的 09 點。
+2. **用這個小時全部的樣本重算：** 09:00 的 3 台＋09:30 的 6 台 → avg 4.5、min 3、max 6。只用新的那筆算會得到 avg 6，是錯的；直接再加一列，會變成同一站同一小時兩列，grain 壞掉。平均值沒辦法只靠新資料更新。
+3. **換掉舊列：** `unique_key`（站點＋小時）加 `delete+insert`，先刪掉 mart 裡 X／09 點的舊列（avg 3），再插入新列。靠 key 對上，不管這個小時是多久以前。
+
+#### 每次跑的三步（網店範例，停在 run 2 那一刻）
+
+輸入有兩樣：`orders` 共 4 筆，最後一筆是 11/01 的 30 元、11/04 才載入；上一次建好的表共 3 列，每列都存著 `last_loaded_at`。
+
+| 步驟 | SQL | 實際結果 |
+|---|---|---|
+| 1. 上次處理到哪（watermark） | `select max(last_loaded_at) from this` | `2026-11-03 09:00:00+08:00` |
+| 2. 之後寫進來的資料屬於哪些 key | `select distinct shop, order_day from orders where loaded_at > (select max(last_loaded_at) from this)` | `('A', '2026-11-01')` |
+| 3. 只重算這些 key，用它們全部的資料 | `orders` 和第 2 步的結果 `join` 後 `group by` | `('A', '2026-11-01', '130', '2', '2026-11-04 09:00:00+08:00')` |
+
+- **log 的 `INSERT 0 1`：** 第 3 步只輸出 1 列，dbt 用它換掉表裡 A／11-01 的舊列。
+- **watermark 讀得出來的原因：** 表裡每列都多存了 `last_loaded_at`。這列重算後變成 11/04，下次第 1 步就會讀到這個新位置。
+- **第一次跑為什麼是全量：** 第 2 步的 `where` 包在 `{% if is_incremental() %}` 裡，表還不存在時不會加上去，所有 key 都被選到（`SELECT 3`）。
+- **對應到專案：** `orders` → staging、`loaded_at` → `ingested_at`、「店＋日」→「站點＋小時」（小時用 `slot_time` 算）、`last_loaded_at` → mart 要多加的那一欄。
+
+#### 要不要做（依現行文件）
+
+- **要，這就是 D16：** HTML 的 D16 寫「選新 ingestion 批次，不按 observed_at 最大值丟晚到資料」（`observed_at` 是 11/10 改名前的 `slot_time`）；spec 寫「正式驗收需具備 incremental model：只選新增 ingestion 批次，重新算所有受影響 station-hour」。
+- **哪些一定要：** 第 2、3 步一定要。第 1 步「記住上次處理到哪」二選一，由 Andrew 決定：mart 多存一欄最大的 `ingested_at`（watermark 欄），或另外記下已處理的 `batch_id`（批次清單，mart 就不用多一欄）。
+- **主要改哪些檔：** `dbt/models/marts/mart_station_hourly.sql`（config、找出受影響的站點小時、只輸出重算結果、watermark 欄）和 `mart_station_hourly.yml`（`on_schema_change: fail`、contract 補新欄位）；int 要不要改，看平均、最小、最大的公式放在哪裡。
+
+核對依據：兩段 SQL 的輸出是 2026-11-17 在 youbike_test 實跑的唯讀查詢（只用 `values`，沒有建表）；文件依據是當日現行的 dashboard HTML D16 列與 platform_spec。本筆記不增加驗收完成數。
