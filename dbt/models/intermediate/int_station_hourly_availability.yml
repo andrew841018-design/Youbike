@@ -27,3 +27,5 @@ models:
         data_type: integer
       - name: avg_return_bikes
         data_type: float
+      - name: last_ingested_at
+        data_type: timestamptz

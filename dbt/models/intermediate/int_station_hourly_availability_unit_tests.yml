@@ -4,14 +4,14 @@ unit_tests:
     given:
       - input: ref('stg_youbike_snapshot')
         rows:
-          - {station_id: "500101001", slot_time: "2026-11-13 09:00:00+00", available_rent_bikes: 3, available_return_bikes: 7}
-          - {station_id: "500101001", slot_time: "2026-11-13 09:30:00+00", available_rent_bikes: 6, available_return_bikes: 4}
-          - {station_id: "500101001", slot_time: "2026-11-13 10:00:00+00", available_rent_bikes: 2, available_return_bikes: 8}
-          - {station_id: "500101002", slot_time: "2026-11-13 09:00:00+00", available_rent_bikes: 10, available_return_bikes: 0}
-          - {station_id: "500101002", slot_time: "2026-11-13 18:30:00+08", available_rent_bikes: 5, available_return_bikes: 5}
+          - {station_id: "500101001", slot_time: "2026-11-13 09:00:00+00", available_rent_bikes: 3, available_return_bikes: 7, ingested_at: "2026-11-13 10:15:00+00"}
+          - {station_id: "500101001", slot_time: "2026-11-13 09:30:00+00", available_rent_bikes: 6, available_return_bikes: 4, ingested_at: "2026-11-13 09:30:40+00"}
+          - {station_id: "500101001", slot_time: "2026-11-13 10:00:00+00", available_rent_bikes: 2, available_return_bikes: 8, ingested_at: "2026-11-13 10:00:40+00"}
+          - {station_id: "500101002", slot_time: "2026-11-13 09:00:00+00", available_rent_bikes: 10, available_return_bikes: 0, ingested_at: null}
+          - {station_id: "500101002", slot_time: "2026-11-13 18:30:00+08", available_rent_bikes: 5, available_return_bikes: 5, ingested_at: "2026-11-13 18:30:40+08"}
     expect:
       rows:
-        - {station_id: "500101001", slot_hour: "2026-11-13 09:00:00+00", min_rent_bikes: 3, max_rent_bikes: 6, avg_rent_bikes: 4.5, min_return_bikes: 4, max_return_bikes: 7, avg_return_bikes: 5.5}
-        - {station_id: "500101001", slot_hour: "2026-11-13 10:00:00+00", min_rent_bikes: 2, max_rent_bikes: 2, avg_rent_bikes: 2, min_return_bikes: 8, max_return_bikes: 8, avg_return_bikes: 8}
-        - {station_id: "500101002", slot_hour: "2026-11-13 09:00:00+00", min_rent_bikes: 10, max_rent_bikes: 10, avg_rent_bikes: 10, min_return_bikes: 0, max_return_bikes: 0, avg_return_bikes: 0}
-        - {station_id: "500101002", slot_hour: "2026-11-13 10:00:00+00", min_rent_bikes: 5, max_rent_bikes: 5, avg_rent_bikes: 5, min_return_bikes: 5, max_return_bikes: 5, avg_return_bikes: 5}
+        - {station_id: "500101001", slot_hour: "2026-11-13 09:00:00+00", min_rent_bikes: 3, max_rent_bikes: 6, avg_rent_bikes: 4.5, min_return_bikes: 4, max_return_bikes: 7, avg_return_bikes: 5.5, last_ingested_at: "2026-11-13 10:15:00+00"}
+        - {station_id: "500101001", slot_hour: "2026-11-13 10:00:00+00", min_rent_bikes: 2, max_rent_bikes: 2, avg_rent_bikes: 2, min_return_bikes: 8, max_return_bikes: 8, avg_return_bikes: 8, last_ingested_at: "2026-11-13 10:00:40+00"}
+        - {station_id: "500101002", slot_hour: "2026-11-13 09:00:00+00", min_rent_bikes: 10, max_rent_bikes: 10, avg_rent_bikes: 10, min_return_bikes: 0, max_return_bikes: 0, avg_return_bikes: 0, last_ingested_at: null}
+        - {station_id: "500101002", slot_hour: "2026-11-13 10:00:00+00", min_rent_bikes: 5, max_rent_bikes: 5, avg_rent_bikes: 5, min_return_bikes: 5, max_return_bikes: 5, avg_return_bikes: 5, last_ingested_at: "2026-11-13 10:30:40+00"}
