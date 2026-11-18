@@ -1978,6 +1978,8 @@ same object: False
 - watermark 是記錄「資料處理到哪裡」的值：用只會隨新資料變大的欄位（YouBike 用 `ingested_at`），處理完存下來、下次當起點，處理完再往後移。YouBike 的 mart 用 `(select max(last_ingested_at) from {{this}})` 每次現算，不是另一張表；`slot_time` 會因為晚到資料而比上次的值小，不能當 watermark。
 - 增量找新資料看寫入時間（`ingested_at` 或已處理批次清單），不看 `slot_time`：dbt 已經算過較新的 slot 之後，舊 slot 的資料才寫進來（手動重跑、補跑），用 `slot_time` 篩會永遠漏掉，而且不會報錯。選到新資料後，用它的 `slot_time` 決定屬於哪個小時，用那個小時全部的樣本重算，再靠 key（站點＋小時）delete+insert 換掉舊列，所以舊的小時也會被更新。
 - 檢查三種：unit test（建之前，驗 SQL 邏輯）、contract（建的當下，驗欄位名稱與型別）、data test（建之後，驗真實資料）。檢查放在會出錯的那層；失敗會擋下游，但不刪資料。
+- 測增量 model 的 unit test：yml 寫兩張假的查詢結果，int 的「現在」和 mart 的「上一版」（`input: this`，開 `is_incremental: true` 時必填），讓 mart 真正的 SQL 跑一次再比 expect；watermark 每次只從 `this` 算一次，int 每列都跟它比（大於或等於就選，小於或 NULL 不動）。每筆測資都要對現行程式測到別筆測不到的情況（Andrew 2026-11-17）。
+- 對帳測試（singular test）：在 `dbt/tests/` 寫一段 SELECT，把「增量的 mart 和重算結果不一樣的列」查出來，dbt 自動數列數，0 列 PASS、有列 FAIL；它驗的是增量過程沒漏，公式本身對不對要靠手算答案的 unit test。每次 build 只比最近 2 天有樣本寫入的小時、每 30 天全量（Andrew 2026-11-18）；篩選要寫在 GROUP BY 之前，所以從 stg 讀樣本自己分組。
 - 目前的決定：`coverage` 與 `sample_count` 於 2026-11-13 拿掉（漏抓看 `run_status`）；mart 用 `ref` 讀 intermediate、不重算；新鮮度要不要放 mart 待 Andrew 決定。
 
 ### 2026-11-10：sources.yml 是做什麼的，以及資料庫、schema、表三層名字
@@ -3017,3 +3019,136 @@ A 一筆都沒選到，只有 B 選到晚到的那筆。
 - **主要改哪些檔：** `dbt/models/marts/mart_station_hourly.sql`（config、找出受影響的站點小時、只輸出重算結果、watermark 欄）和 `mart_station_hourly.yml`（`on_schema_change: fail`、contract 補新欄位）；int 要不要改，看平均、最小、最大的公式放在哪裡。
 
 核對依據：兩段 SQL 的輸出是 2026-11-17 在 youbike_test 實跑的唯讀查詢（只用 `values`，沒有建表）；文件依據是當日現行的 dashboard HTML D16 列與 platform_spec。本筆記不增加驗收完成數。
+
+### 2026-11-17：D17 增量 mart 的 unit test：input、this、watermark 怎麼對上
+
+**一句話：** unit test 用 yml 寫的兩張假查詢結果（int 的「現在」、mart 的「上一版」也就是 `this`），讓 mart 真正的 SQL 跑一次，檢查它選出來的列；每筆測資都要對現行程式測到別筆測不到的情況。
+
+問題（Andrew 11/17 晚上依序問）：`input` 是什麼？`this` 底下是假的嗎、不給會怎樣？unit test 跟 mart 有什麼關係？`model:` 寫別的 model 會怎樣？10:15、10:00:40、10:30:40 這幾筆是不是重複？watermark 是一筆一筆比、邊比邊更新嗎？`this` 裡是不是同一個時間點？D17 剩下三樣要幹嘛、寫在哪？
+
+#### 一個 unit test 的三塊
+
+| 部分 | 真或假 | 寫在哪 |
+|---|---|---|
+| mart 的 SQL | 真的，被測的就是它 | `model: mart_station_hourly` |
+| int 的資料 | 假的：模擬「這次跑時查 int 會得到的結果」 | `input: ref('int_station_hourly_availability')` |
+| mart 的上一版 | 假的：模擬「上次跑完那一刻查 mart 會得到的結果」 | `input: this` |
+
+- **`input`：** 被測的 SQL 從哪裡讀資料。SQL 讀幾個地方就給幾個；底下的列用那個來源的欄位，只寫用得到的欄位，沒寫的是 NULL。
+- **dbt 怎麼換：** 把 `{{ref(...)}}`、`{{this}}` 換成這些假資料，編譯後變成 `__dbt__cte__int_station_hourly_availability`、`__dbt__cte__mart_station_hourly`。不讀真表的資料，只讀真表的欄位型別，所以第一次跑之前 mart 表要先存在。
+- **一定要給 `this`：** 開了 `is_incremental: true` 卻不給，讀設定時就報錯，整個 dbt 都跑不了：`Unit test ... for incremental model 'mart_station_hourly' must have a 'this' input`。
+
+#### `model:` 決定測哪一份 SQL
+
+| `model:` 寫成 | 結果（副本實跑） |
+|---|---|
+| `mart_station_hourly` | PASS |
+| `int_station_hourly_availability` | 改跑 int 的 SQL；int 讀 stg，但沒給 stg 的假資料，所以 ERROR：`depends on a node named 'stg_youbike_snapshot' which was not found` |
+| 不存在的名字 | Parsing Error：`Unable to find model ...` |
+
+yml 和 .sql 靠名字配對，yml 的檔名不重要。build 輸出 `mart_station_hourly::測試名` 裡，`::` 前面就是 model。
+
+#### watermark 怎麼比：一次一批，不是一筆一筆
+
+1. **每次跑只算一次 watermark：** `select max(last_ingested_at) from {{this}}`，跑的過程中不變。
+2. **int 每一列都跟這同一個數字比，不是跟自己的舊版本比：** 大於或等於 watermark 就選出來；小於或 NULL 不動。
+3. **寫回：** 選出來的列靠 `unique_key` 加 `delete+insert` 寫回 mart，同一站同一小時就換掉，沒有就新增。寫完 mart 的最大值變大，下次的 watermark 自動往後，不用另外存。
+
+- 等於 watermark 的列每次都會被重寫，值不變，所以沒有新資料時 build 也會顯示 `INSERT 0 1`。
+- unit test 只做到第 2 步，不會寫回，`this` 不會變，所以每次結果都一樣。
+
+#### 兩種時間不要混在一起
+
+| | 意思 | 這個測試 |
+|---|---|---|
+| `this` 代表的時間點 | 上次跑完去看表的那一刻，整張表是同一刻 | 10:05 |
+| 每列的 `last_ingested_at` | 那個小時最新一筆樣本寫進資料庫的時間 | 09:30:40、10:00:40、NULL |
+
+最大的 `last_ingested_at` 代表「上次看過的資料最新到哪」，也就是 watermark，不是看表的時間。
+
+#### 這個測試每一筆在測什麼（watermark 10:00:40）
+
+| int 的列 | last_ingested_at | 選不選 | 意義 | 抓得到的寫錯（副本實跑） |
+|---|---|---|---|---|
+| 1 號站 09 點 | 10:15 | 選 | 晚到：舊的小時多了一筆晚到樣本，重算後換掉，平均從 6 變 4.5 | watermark 改用 `slot_hour`：FAIL 1 |
+| 1 號站 10 點 | 10:00:40 | 選 | 相同邊界：等於 watermark 也要選 | `>=` 改成 `>`：FAIL 1 |
+| 2 號站 09 點 | NULL | 不選 | 舊資料沒有寫入時間，不重算 | 無 |
+| 2 號站 10 點 | 10:30:40 | 選 | 現行 SQL 下和晚到那筆是同一個判斷（都比 watermark 新），沒有自己的意義 | 只防「只更新 mart 已有的小時」這種假設性寫法 |
+
+- **`this` 不能隨便給：** watermark 由它決定。假如最大值填成 11:00，int 四筆都不會被選，什麼都測不到。其他欄位（站、小時、車數）對現行 SQL 的結果沒有影響，照「10:05 跑完時的樣子」填，讓情境前後一致。
+- **Andrew 的原則：任何測資都要有其意義。** 依這個原則，助理判斷 2 號站 10 點那筆應該拿掉（given 和 expect 各刪一筆）；要不要拿掉由 Andrew 動手或指示。
+
+#### D17 剩下的測試：寫一次，之後每次 dbt build 自動跑
+
+| 測試 | 寫在哪 | 防什麼 |
+|---|---|---|
+| 重跑沒有新資料 | 不寫（2026-11-18 Andrew 決定） | mart 每次用 int 的完整結果 delete+insert，沒有新資料時重跑必然一樣；重播和全量是否一致，由對帳測試每次 build 驗證 |
+| 缺的小時不補 | 不寫，改用證據（2026-11-18 Andrew 決定） | 補 0 或抄上一小時會做出假資料（漏抓看 `run_status`，11/13 定案）。但 int 用 GROUP BY，只替有樣本的小時產生列，專門寫的測試在現行程式下永遠不會失敗。證據：A 站只有 09:10、11:20 兩筆樣本，實跑結果只有 09:00、11:00 兩列；測試庫有樣本的站點小時 54,643 個，mart、int 也各 54,643 列（11/17 查），之後由對帳測試每次 build 確認 |
+| 對帳 | `dbt/tests/` 新增 .sql，兩個方向的 `except`，0 列才 PASS。2026-11-18 Andrew 決定：每次 build 只比最近 2 天有樣本寫入的小時（用 `ingested_at` 找、含重播的舊小時，撈這些小時的全部樣本重算），另每 30 天一次全量 | 增量篩選寫錯，mart 和全量結果對不上；只比最近 2 天是為了資料變大時每次 build 的時間固定 |
+
+unit test 用假資料驗證篩選規則；對帳測試則是每次 build 拿真實資料整張比。
+
+**2026-11-18 補充：** 助理一度代寫「重跑沒有新資料」的 unit test：等於 watermark 的那列和第一個測試的邊界列重複；比 watermark 舊的那列守的是「只處理新資料」（就算壞了，結果仍然正確，只是變成每次全部重算），跟重跑正確與否無關。Andrew 說「一樣規則下重跑一定是完全一樣」，判定多餘，已拿掉。D17 剩缺小時不補與對帳兩個測試。同日 Andrew 再決定，缺小時不補也不另寫測試，改用上表的證據，**D17 只剩對帳測試**。
+
+核對依據：this 被換成假資料、`model:` 寫錯、拿掉 this，以及四筆各自抓不抓得到錯，都在 2026-11-17 晚上用 scratchpad 副本實跑（youbike_test 裡的獨立 schema，跑完已刪）；專案的 dbt build 6/6 PASS。mart unit test 的 `this` 與 expect 由 Andrew 要求助理補完。
+
+### 2026-11-18：D17 對帳測試：比什麼、為什麼只比兩天、SQL 怎麼寫、dbt 怎麼判斷
+
+**一句話：** 對帳測試是一段把「mart 和重算結果不一樣的列」查出來的 SELECT，dbt 只負責數列數判斷 PASS／FAIL；每次 build 只比最近 2 天有樣本寫入的小時，每 30 天全量比一次。
+
+問題（Andrew 11/18 依序問）：對帳在幹嘛、是不是抽樣？資料變大會不會卡？兩邊都錯怎麼辦，有沒有更根本的測試？最近兩天用 `slot_time` 還是 `ingested_at`、mart 那邊用哪個欄位？為什麼從 stg 讀、不從 int 或原始表讀？GROUP BY 和 WHERE 誰先？JOIN 和 `except` 哪個好？SQL 的結果怎麼存成變數？dbt 怎麼知道 PASS／FAIL，`dbt/tests` 能不能改名？
+
+#### 對帳在測什麼，抓不到什麼
+
+| 測試 | 標準答案從哪來 | 抓什麼錯 |
+|---|---|---|
+| int unit test（D15） | 依定義手算 | 公式本身錯（int、mart 一起錯也抓得到） |
+| mart unit test（D17） | 依選取規則手寫 | 該選的小時沒選到或選錯 |
+| 對帳（D17） | 從樣本重算的全量結果 | 公式對，但增量拼的過程漏掉或沒更新到 |
+
+- **不是抽樣：** `except` 比的是整張（或整個範圍）每一列。
+- **兩邊一起錯時對帳抓不到：** 副本把 int 的平均故意寫成取最大值，mart 對 int 對帳 0 列不同，但手算的 int unit test `FAIL 1`。所以「更根本」的測試是答案由人依定義算的 unit test；對帳負責的是真實資料上「增量＝全量」。
+
+#### 資料變大：每次 build 只比 2 天，另每 30 天全量（Andrew 決定）
+
+- **實測：** 測試庫 61,875 筆樣本，全量對帳 0.45 秒；正式庫約 435 萬筆（每天多約 8.7 萬），照比例推算一次約幾十秒到一分鐘，沒在正式庫實跑。
+- **為什麼可以只比最近的：** 增量每次只動有新資料的小時，更早的小時之前對過、之後沒人動。
+- **為什麼還要每 30 天全量：** 補抓晚了 2 天以上才重播的資料。只做 30 天一次的話，錯誤最多藏 30 天才發現，所以要和每次的 2 天對帳搭配。
+
+#### 「最近兩天」怎麼定：時間只用一次
+
+1. **起點（`since`）：** stg 最新的 `ingested_at` 往回 2 天。不用 `now()`（測試庫資料停在 11/11，往回 2 天一個小時都沒有，測試永遠比 0 列、等於沒測）；也不用 mart 的 watermark（被檢查的一方不該決定檢查範圍）。
+2. **stg 那邊：** `ingested_at >= since` 的樣本屬於哪些小時（用 `ingested_at`，不是 `slot_time`；重播進來的舊小時 `slot_time` 很早，`ingested_at` 才是最近的），再拿**這些小時的全部樣本**重算。
+3. **mart 那邊：** `last_ingested_at >= since`，起點同一個。
+
+- **兩邊標準看起來不同，其實是同一條規則：** 「這小時最大的 `ingested_at` 在兩天內」等於「這小時至少有一筆樣本在兩天內」。實測兩邊都挑出 25,548 個小時、完全相同。mart 若出錯，兩邊挑到的範圍不同，差異本身就會讓測試 FAIL。
+- **不能直接用 `ingested_at` 篩樣本再分組：** 同一小時較早寫進來的樣本會被丟掉。例子：09 點有 3 台（舊）和 7 台（剛重播）兩筆，直接篩算出 7，先找小時再拿全部樣本算出 5（正確）。
+
+#### 先篩再算：WHERE、GROUP BY 與 view
+
+- **順序：** `FROM → WHERE → GROUP BY → HAVING → SELECT`。WHERE 在分組前一筆一筆篩；HAVING 在分組後篩每組的結果。
+- **對 view 下 WHERE 不會跑到它的 GROUP BY 前面：** 讀 int 再寫 WHERE 是外層查詢，int 自己的 SELECT（含 GROUP BY）是內層，要先跑完。實際執行計畫：讀出全部樣本 → HashAggregate 分組 → `Filter: max(ingested_at) >= ...`，等於分組後的 HAVING。`last_ingested_at` 分組前根本不存在。
+- **所以要從 stg 讀：** int 本身就是「讀 stg 再分組」，測試讀 stg、自己先篩再分組，就和 int 同一層。不直接讀原始表 `response`，是為了和 int 用同一份輸入（staging 以後若加清理規則，兩邊才不會因輸入不同而假 FAIL），也符合「原始表只讓 staging 讀」的分層。
+- **省的是分組，不是讀取：** 實測讀 int 再篩要分組全部 61,875 筆（247 ms），從 stg 先篩只分組 25,548 筆（97 ms）。但兩種都把 `response` 整張掃過，因為 `ingested_at` 沒有索引；要連讀取都只碰最近 2 天，需要 `ingested_at` 索引，等任務 5 接正式庫時再決定。
+- **篩選不能寫進 int：** int 要保持全量，mart 第一次建表和 30 天全量對帳都要讀它。
+
+#### SQL 寫法
+
+- **CTE 當變數：** `with anchor as (select max(ingested_at) - interval '2 days' as since from ...)`，之後用 `(select since from anchor)` 取值。`anchor` 是一列一欄的臨時表，`since` 型別是 timestamptz；它只在這段 SQL 跑的期間存在，跑完就不見，不會寫進資料庫。
+- **`max()` 不能直接寫在 WHERE：** 報錯 `aggregate functions are not allowed in WHERE`；包成子查詢 `(select max(...) from ...)` 就可以，mart 第 11 行就是這種寫法。
+- **檢查 NULL：** SELECT 裡沒有 `if`，用 `is null`、`case when ... then ... else ... end`、`coalesce(值, 備用值)`；不能寫 `= null`。
+- **結構：** `recent_hours`（① 用 `ingested_at` 找小時）→ `recomputed`（② 這些小時的全部樣本，WHERE 寫在 GROUP BY 前）→ `mart_recent`（③ mart 同範圍）→ 兩個方向的 `except`（④ 不需要 WHERE）。
+- **`except` 是「扣掉」：** `A except B` = A 扣掉 B 裡也有的列，兩邊一樣的抵銷，剩下的就是差異。兩個方向都做，少一列、多一列、值不同都抓得到，NULL 自動當成相同；每邊前面加 `'only in ...' as side` 標示欄，FAIL 時好查。兩邊欄位要一樣多、順序一樣、型別相容。
+- **想用 JOIN：** 要用 FULL OUTER JOIN（一般 JOIN 會讓配不到的列消失），每一欄都用 `is distinct from`（`<>` 遇到 NULL 不會判定為不同）。好處是失敗時兩邊的值並排；代價是 7 個欄位都要寫條件，漏寫一欄就變成沒在比。
+
+#### dbt 怎麼判斷 singular test
+
+- **外層判斷是 dbt 自動包的：** 放在 `dbt/tests/` 的 SELECT，dbt 會包成 `select count(*) as failures, count(*) != 0 as should_error from (你的 SQL)`，0 列 PASS、1 列以上 `FAIL N`。不用自己寫 if，也不用加任何設定（`severity`、`error_if` 是可選的）。
+- **數的是列數，不是值：** `select 0` 會 `FAIL 1`；要把有問題的列直接查出來。
+- **dbt 不懂 SQL 的意思：** 一段毫不相關、永遠查不到東西的 SQL 也會 PASS。所以要故意製造錯誤，確認測試真的會 FAIL。
+- **想讓「沒資料」算失敗：** 寫成在那種情況吐出一列，例如 `select '沒有最近資料' as problem where not exists (...)`。
+- **資料夾名稱：** `tests` 是 `dbt_project.yml` 的 `test-paths` 預設值，可以改；檔名就是測試名。空的 `.sql` 檔會被略過。
+- **看結果：** 寫的時候用 `dbt show --inline "select ... {{ ref(...) }}"` 看任一段 SQL 的結果（預設 5 列，`--limit` 調整）；測試失敗時加 `--store-failures`，失敗的列會存進 `dbt_dbt_test__audit` schema。
+- **全量對帳平常不跑（2026-11-18 採用）：** 全量測試檔第一行寫 `{{ config(tags=['monthly']) }}`；`dbt/selectors.yml` 的預設選擇器 `default_build` 排除 `tag:monthly`，所以沒加參數的 `dbt build` 不會跑它；要跑時用 `dbt test --select tag:monthly`。用 `--select` 指定範圍時預設選擇器不套用，要自己加 `--exclude tag:monthly`。
+
+核對依據：本則數字都是 2026-11-18 在 youbike_test 實跑（唯讀查詢、EXPLAIN，以及 scratchpad 副本的獨立 schema，跑完已刪）；30 天全量的時間是推算，沒在正式庫跑。決定（每次 2 天、每 30 天全量；重播與缺小時不另寫 unit test）已同步到兩份 HTML 和三份 md。
