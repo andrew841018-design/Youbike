@@ -1,0 +1,11 @@
+selectors:
+  - name: default_build
+    description: "平常的 dbt build／test：全部都跑，但排除標了 monthly 的測試（每 30 天的全量對帳）"
+    default: true
+    definition:
+      union:
+        - method: fqn # full qualified name,each files have one unique fqn
+          value: "*"
+        - exclude:
+            - method: tag
+              value: monthly

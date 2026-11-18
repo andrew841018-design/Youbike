@@ -1,0 +1,110 @@
+unit_tests:
+  - name: mart_station_hourly_unit_tests
+    model: mart_station_hourly
+    overrides:
+      macros:
+        is_incremental: true
+    given:
+      - input: ref('int_station_hourly_availability')
+        rows:
+          # int 現在的結果。1 號站 09 點：09:00 那筆樣本 10:15 才進來（晚到），所以 last_ingested_at 變成 10:15
+          - {
+              station_id: "500101001",
+              slot_hour: "2026-11-13 09:00:00+00",
+              min_rent_bikes: 3,
+              max_rent_bikes: 6,
+              avg_rent_bikes: 4.5,
+              min_return_bikes: 4,
+              max_return_bikes: 7,
+              avg_return_bikes: 5.5,
+              last_ingested_at: "2026-11-13 10:15:00+00",
+            }
+          # 1 號站 10 點：沒有新樣本，last_ingested_at 還是 10:00:40
+          - {
+              station_id: "500101001",
+              slot_hour: "2026-11-13 10:00:00+00",
+              min_rent_bikes: 2,
+              max_rent_bikes: 2,
+              avg_rent_bikes: 2,
+              min_return_bikes: 8,
+              max_return_bikes: 8,
+              avg_return_bikes: 8,
+              last_ingested_at: "2026-11-13 10:00:40+00",
+            }
+          # 2 號站 09 點：舊資料，ingested_at 是 NULL
+          - {
+              station_id: "500101002",
+              slot_hour: "2026-11-13 09:00:00+00",
+              min_rent_bikes: 10,
+              max_rent_bikes: 10,
+              avg_rent_bikes: 10,
+              min_return_bikes: 0,
+              max_return_bikes: 0,
+              avg_return_bikes: 0,
+              last_ingested_at: null,
+            }
+      # this：上次 mart 跑完時表裡的樣子（大約 10:05 跑的）。watermark = 這裡最大的 last_ingested_at = 10:00:40
+      - input: this
+        rows:
+          # 1 號站 09 點：當時只有 09:30 那筆樣本，10:15 那筆晚到的還沒進來
+          - {
+              station_id: "500101001",
+              slot_hour: "2026-11-13 09:00:00+00",
+              min_rent_bikes: 6,
+              max_rent_bikes: 6,
+              avg_rent_bikes: 6,
+              min_return_bikes: 4,
+              max_return_bikes: 4,
+              avg_return_bikes: 4,
+              last_ingested_at: "2026-11-13 09:30:40+00",
+            }
+          # 1 號站 10 點：當時最新的一筆，也就是 watermark
+          - {
+              station_id: "500101001",
+              slot_hour: "2026-11-13 10:00:00+00",
+              min_rent_bikes: 2,
+              max_rent_bikes: 2,
+              avg_rent_bikes: 2,
+              min_return_bikes: 8,
+              max_return_bikes: 8,
+              avg_return_bikes: 8,
+              last_ingested_at: "2026-11-13 10:00:40+00",
+            }
+          # 2 號站 09 點：舊資料，ingested_at 是 NULL
+          - {
+              station_id: "500101002",
+              slot_hour: "2026-11-13 09:00:00+00",
+              min_rent_bikes: 10,
+              max_rent_bikes: 10,
+              avg_rent_bikes: 10,
+              min_return_bikes: 0,
+              max_return_bikes: 0,
+              avg_return_bikes: 0,
+              last_ingested_at: null,
+            }
+    expect:
+      rows:
+        # 1 號站 09 點：晚到的樣本讓它變新，用整個小時的樣本重算（晚到）
+        - {
+            station_id: "500101001",
+            slot_hour: "2026-11-13 09:00:00+00",
+            min_rent_bikes: 3,
+            max_rent_bikes: 6,
+            avg_rent_bikes: 4.5,
+            min_return_bikes: 4,
+            max_return_bikes: 7,
+            avg_return_bikes: 5.5,
+            last_ingested_at: "2026-11-13 10:15:00+00",
+          }
+        # 1 號站 10 點：last_ingested_at 剛好等於 watermark，>= 會再選一次，值不變（相同邊界）
+        - {
+            station_id: "500101001",
+            slot_hour: "2026-11-13 10:00:00+00",
+            min_rent_bikes: 2,
+            max_rent_bikes: 2,
+            avg_rent_bikes: 2,
+            min_return_bikes: 8,
+            max_return_bikes: 8,
+            avg_return_bikes: 8,
+            last_ingested_at: "2026-11-13 10:00:40+00",
+          }
