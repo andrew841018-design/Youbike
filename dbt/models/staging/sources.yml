@@ -1,6 +1,6 @@
 sources:
   - name: youbike
-    schema: public
+    schema: "{{var('test_schema','public')}}"
     tables:
       - name: raw_bytes
         columns:
@@ -24,4 +24,3 @@ sources:
           - name: source_update_time
           - name: slot_time
           - name: ingested_at
-          
