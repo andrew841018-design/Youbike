@@ -4,6 +4,8 @@
 
 整理說明（2026-11-13）：Andrew 要求把重複的概念整合。筆記改成依主題分組：每個主題開頭的「主題重點」整合了各則的結論；原本各則保留在主題底下（含日期、範例和核對依據），重複的段落改成指向主題重點或相關小節。新的筆記照主題放進對應的段落。
 
+整理說明（2026-11-23）：同一個問題分散在幾則的，合併成一則：標題用最早的日期，併進來的那幾則在小標題標「（日期 補）」，原本的小節降一級；完全重複的句子刪掉，改成指向保留的那一處。
+
 ## 目錄
 
 - 1. 環境設定與 import
@@ -171,8 +173,9 @@ ModuleNotFoundError: No module named 'helper'
 
 - `*args` 收沒寫名字的值（tuple），`**kwargs` 收寫了名字的值（dict）；兩者都是傳值，差別在呼叫時有沒有寫參數名稱。
 - `@classmethod` 的 `cls` 是呼叫它的那個類別，由 Python 自動傳入，不是關鍵字，也不用自己建立。
+- 同一個 `*` 有兩種位置：寫在 `def` 的參數（`def run_dbt(*extra)`）是「收」，把呼叫時多給的值收成 tuple；寫在清單裡（`[..., *extra]`）是「攤」，把 tuple 的每一項依序放進清單。
 
-### 2026-09-26：`*args`、`**kwargs` 與傳入參數的方式
+### 2026-09-26：`*args`、`**kwargs` 與傳入參數的方式；`*` 在清單裡攤開
 
 #### 核心觀念
 
@@ -231,6 +234,45 @@ def fake_get(*args):
 所以「能接很多個」不代表兩種傳法都能接；目前替身使用兩者，是為了配合產品既有的呼叫方式。
 
 對照位置：[測試的 http_200_response](../tests/unit/test_youbike_extract.py) 與 [產品的 requests.get 呼叫](../src/extract/youbike.py)。本節只記錄概念，不修改程式或增加測試要求。
+
+#### `*extra`：在 def 收集多給的參數，在清單裡攤開（2026-11-23 補）
+
+**一句話：** 同一個 `*`，寫在 `def` 的參數裡是「收」，把呼叫時多給的值收成 tuple；寫在清單裡是「攤」，把 tuple 的每一項依序放進清單。`extra` 只是名字，和上面 9/26 的 `*args` 是同一個語法。
+
+情境：D19 要從 pytest 跑兩次 dbt，一次正常、一次加 `--vars`。用同一個函式，多給的參數接在指令最後面。
+
+##### 範例（2026-11-23 實跑，圖書館情境的 `dbt compile`）
+
+```python
+def run_dbt(*extra):
+    cmd = [DBT, "compile", "--project-dir", P, "--profiles-dir", P, "--select", "stg_loans", *extra]
+    return subprocess.run(cmd, capture_output=True, text=True, env=ENV)
+
+r1 = run_dbt()
+r2 = run_dbt("--vars", "{lib_schema: library_v2}")
+```
+
+| 呼叫 | `extra` 的值 | `cmd` 最後幾項 | `len(cmd)` |
+|---|---|---|---|
+| `run_dbt()` | `()`，空 tuple | `'--select', 'stg_loans'` | 8 |
+| `run_dbt("--vars", "{lib_schema: library_v2}")` | `('--vars', '{lib_schema: library_v2}')` | `'--select', 'stg_loans', '--vars', '{lib_schema: library_v2}'` | 10 |
+
+結果：`r1` 編譯出的 SQL 讀 `"public"."loans"`，`r2` 讀 `"library_v2"."loans"`；兩次結束碼都是 0，因為 `compile` 不建表。
+
+##### 兩個位置的 `*`
+
+| 寫在哪 | 作用 | 例子 |
+|---|---|---|
+| `def` 的參數 | 收：呼叫時多給的值收成 tuple；沒多給就是 `()` | `def run_dbt(*extra)` |
+| 清單裡 | 攤：把 tuple 的每一項依序放進清單；空 tuple 什麼都不加 | `[..., *extra]` |
+
+##### 容易搞混的地方
+
+- **清單裡少寫 `*`：** `["dbt", "compile", extra]` 會把整個 tuple 當成清單的一項（長度 3，不是 4），交給 `subprocess.run` 會報 `TypeError: expected str, bytes or os.PathLike object, not tuple`（2026-11-23 實跑）。
+- **為什麼指令用清單：** 清單的每一項原封不動當成一個參數，像 `{lib_schema: library_v2}` 這種有空格和大括號的值，不用煩惱引號。
+- **名字自己取：** `*extra`、`*args` 都可以，重點是前面的 `*`。
+
+核對依據：表格和錯誤訊息都是 2026-11-23 在 scratchpad 實跑的輸出（`dbt compile` 只寫 scratchpad 的 target，不寫資料庫）。
 
 ### 2026-10-16：classmethod 的 cls 代表誰，為什麼使用它
 
@@ -1200,7 +1242,7 @@ with psycopg.connect(dsn, autocommit=True) as conn:
 - alias：API 的名字只留在模型（`Field(alias="sno")`），程式和資料庫一律用 `station_id` 這類名字（2026-11-10 起）。
 - 現況：2026-11-09 已接進產品（`check_json` 移除，`load_youbike` 入口整批驗）；2026-11-10 起屬性改用資料庫名字。下面 11/09 的範例保留當時的 API 名字寫法。
 
-### 2026-11-09：Pydantic 和 model_validate 的關係：類別寫規則，model_validate 執行檢查
+### 2026-11-09：Pydantic 和 model_validate 的關係：類別寫規則，model_validate 執行檢查；接收什麼、回傳什麼
 
 問題：Pydantic 和 `model_validate` 是什麼關係？
 
@@ -1310,13 +1352,13 @@ Ticket A1 300
 
 核對依據：範例在本機 Youbike/.venv（Python 3.9.6、pydantic 2.13.5）實跑一次；`ValidationError` 是 `ValueError` 子類，是 2026-11-04 在同一環境實測的結果。本筆記不增加驗收完成數。
 
-### 2026-11-09：model_validate 接收什麼、回傳什麼
+#### model_validate 接收什麼、回傳什麼（2026-11-09 補）
 
 問題：Pydantic 的 `model_validate` 接收什麼參數、什麼型別？回傳什麼？出錯會怎樣？
 
-結論：**`模型.model_validate(obj)` 是類別方法，第一個參數 `obj` 通常是一個 dict（key 對應欄位名稱）。檢查通過就回傳一個模型物件，不通過就丟 `ValidationError`。** 它不接受 JSON 文字，也不接受 list：JSON 文字用 `model_validate_json`，整批 list 用 `TypeAdapter(List[模型])`。
+結論：**`模型.model_validate(obj)` 是類別方法，第一個參數 `obj` 通常是一個 dict（key 對應欄位名稱）。** 它不接受 JSON 文字，也不接受 list：JSON 文字用 `model_validate_json`，整批 list 用 `TypeAdapter(List[模型])`。
 
-#### 參數
+##### 參數
 
 | 參數 | 型別 | 用途 |
 |---|---|---|
@@ -1329,7 +1371,7 @@ Ticket A1 300
 
 簽名裡的 `*` 表示後面的參數只能用關鍵字傳，例如 `strict=True`。
 
-#### 範例：不同輸入、回傳值與錯誤
+##### 範例：不同輸入、回傳值與錯誤
 
 ```python
 import inspect
@@ -1411,8 +1453,6 @@ type/loc/msg/input: int_parsing ('count',) Input should be a valid integer, unab
 - **嚴格模式：** 預設會把 `'5'` 轉成 `5`；這次呼叫傳 `strict=True` 就會擋下（`int_type`）。寫在類別的 `model_config = ConfigDict(strict=True)`，就是每次呼叫都嚴格。
 - **回傳值：** 用 `.name`、`.count` 取值；`model_dump()` 轉回 dict。
 - **錯誤：** `ValidationError` 是 `ValueError` 的子類。`error.errors()` 是一個 list，每個錯誤是一個 dict，`type` 是錯誤種類、`loc` 是位置、`msg` 是說明、`input` 是收到的值；`error.error_count()` 是錯誤數量。
-
-（YouBike 的用法整合在本主題的重點。）
 
 一句話記法：`model_validate` 吃 dict、回傳模型物件、錯了丟 `ValidationError`；JSON 文字用 `model_validate_json`，list 用 `TypeAdapter`。
 
@@ -1975,12 +2015,17 @@ same object: False
 - 名字三層：資料庫（`profiles.yml` 的 `dbname`）→ schema（原始表在 `public`，model 放 `profiles.yml` 寫的 `dbt`）→ 表。schema 有兩個意思：表的結構，或資料庫裡的資料夾；設定檔裡的 `schema:` 一律是資料夾。
 - 分層看用途：staging 清理每張來源表，是翻譯層；intermediate 是可重用的零件；mart 依需求組出給人用的表。需求來了先用零件組 mart，組不出來才補零件。
 - 沒寫 `materialized` 時，dbt 預設把 model 建成 view；view 存的是查詢，不是資料：每次有人查才重跑 SELECT，所以永遠是最新、但每次都重算。table 在 dbt build 時跑一次 SELECT、存下那一刻的結果，查詢快，但要重新 build 才看得到新資料。`materialized` 只決定 model 自己被建成什麼（view、table、incremental 第一次建表、ephemeral 不建），從哪裡讀看 `FROM` 裡的 `ref()`／`source()`。要像快取一樣存結果用 `materialized='table'`。incremental 第一次跑等於 table，之後每次只把 SELECT 選出的列寫進原表：沒有 `unique_key` 就直接附加，有 `unique_key` 加 delete+insert 就先刪同 key 再插入；選哪些列由 `is_incremental()` 裡的篩選決定，沒篩會重複寫入。
-- watermark 是記錄「資料處理到哪裡」的值：用只會隨新資料變大的欄位（YouBike 用 `ingested_at`），處理完存下來、下次當起點，處理完再往後移。YouBike 的 mart 用 `(select max(last_ingested_at) from {{this}})` 每次現算，不是另一張表；`slot_time` 會因為晚到資料而比上次的值小，不能當 watermark。
+- watermark 是記錄「資料處理到哪裡」的值：用只會隨新資料變大的欄位（YouBike 用 `ingested_at`），處理完存下來、下次當起點，處理完再往後移。YouBike 的 mart 用 `(select max(last_ingested_at) from {{this}})` 每次現算，不是另一張表。
 - 增量找新資料看寫入時間（`ingested_at` 或已處理批次清單），不看 `slot_time`：dbt 已經算過較新的 slot 之後，舊 slot 的資料才寫進來（手動重跑、補跑），用 `slot_time` 篩會永遠漏掉，而且不會報錯。選到新資料後，用它的 `slot_time` 決定屬於哪個小時，用那個小時全部的樣本重算，再靠 key（站點＋小時）delete+insert 換掉舊列，所以舊的小時也會被更新。
 - 檢查三種：unit test（建之前，驗 SQL 邏輯）、contract（建的當下，驗欄位名稱與型別）、data test（建之後，驗真實資料）。檢查放在會出錯的那層；失敗會擋下游，但不刪資料。
+- unit test 的 yml：寫在 `unit_tests:` 底下，每個測試由 `name`、`model`（被測 model 的 `.sql` 檔名）、`given`（被測 model 直接讀的 `input`，加上手寫的 `rows`）、`expect`（從 `given` 手算的答案）組成；`given`、`rows` 這種可能有好幾個的地方用 `-` 開頭，只有一項也一樣。
 - 測增量 model 的 unit test：yml 寫兩張假的查詢結果，int 的「現在」和 mart 的「上一版」（`input: this`，開 `is_incremental: true` 時必填），讓 mart 真正的 SQL 跑一次再比 expect；watermark 每次只從 `this` 算一次，int 每列都跟它比（大於或等於就選，小於或 NULL 不動）。每筆測資都要對現行程式測到別筆測不到的情況（Andrew 2026-11-17）。
 - 對帳測試（singular test）：在 `dbt/tests/` 寫一段 SELECT，把「增量的 mart 和重算結果不一樣的列」查出來，dbt 自動數列數，0 列 PASS、有列 FAIL；它驗的是增量過程沒漏，公式本身對不對要靠手算答案的 unit test。每次 build 只比最近 2 天有樣本寫入的小時、每 30 天全量（Andrew 2026-11-18）；篩選要寫在 GROUP BY 之前，所以從 stg 讀樣本自己分組。
+- 測失敗情境用假來源表：放在自己的 schema（`schema.表`），用 `(like 來源表)` 照抄欄位（不抄資料、預設值、約束），fixture 建好要 commit，dbt 的連線才看得到；`drop schema … cascade` 連同 schema 裡的東西和建在它上面的物件一起刪，不動 `public`（D19，2026-11-23）。
+- 沒 commit 的 `alter table` 會拿著整張表最強的鎖（`AccessExclusiveLock`），別的連線連 `select` 都要等到它 commit；測試改完表要先 commit 再叫 dbt，否則測試等 dbt、dbt 等鎖，整個卡住（2026-11-23）。
+- `--vars` 的字串是 YAML：`鍵: 值` 的冒號後面要空一格；寫成 `{a:b}` 會變成一個叫 `a:b`、值是空的鍵，變數根本沒設到，`var()` 默默用預設值，dbt 不會報錯。`subprocess.run` 的清單裡整串當成一個元素就好，在 shell 裡要用單引號把整串包起來（D19，2026-11-23）。
 - 目前的決定：`coverage` 與 `sample_count` 於 2026-11-13 拿掉（漏抓看 `run_status`）；mart 用 `ref` 讀 intermediate、不重算；新鮮度要不要放 mart 待 Andrew 決定。
+- dbt 失敗不會變成 Python 的例外，只會回傳結束碼 1：`subprocess.run` 預設不 raise（加 `check=True` 才會），D19 用 `assert returncode != 0` 加上錯誤訊息確認；正式環境由 Airflow 看結束碼，把 task 標成 failed。
 
 ### 2026-11-10：sources.yml 是做什麼的，以及資料庫、schema、表三層名字
 
@@ -2024,6 +2069,8 @@ SELECT count(*) FROM youbike_test.public.response    -> 36327 rows
 ```
 
 兩段式名字的第一段會被當成 schema；`youbike_test` 是資料庫名，不是 schema，所以第 2 種找不到表。
+
+（`schema.表` 點號的其他實跑結果，見〈D19 的假來源表〉一則的「`schema.表` 的點號」。）
 
 #### public 是哪來的
 
@@ -2107,7 +2154,6 @@ source:no_version_demo.shop.orders
 - **怎麼分辨：** 出現在設定檔或 SQL 關鍵字裡的 schema（`schema: public`、`CREATE SCHEMA`、`public.response`）一律是意思 ②；講設計或結構時（「schema 設計」「schema 變更」「這張表的 schema」）通常是意思 ①。
 - **DDL：** 定義結構的 SQL（`CREATE TABLE`、`ALTER TABLE`）統稱 DDL（Data Definition Language），寫的就是意思 ①。dbt 社群慣例常把描述 model 欄位的 yml 命名成 `schema.yml`，那也是意思 ①。
 - **`dbt` 這個 schema 何時出現：** `profiles.yml` 寫的 `schema: dbt` 要等第一次成功 build 出 model，dbt 才會建立。2026-11-13 查測試庫時只有 `public`，原始表 `raw_bytes`、`response`、`run_status` 都在裡面，`search_path` 是 `"$user", public`。
-- **分開放的好處：** Python 和 Airflow 寫的原始表在 `public`，dbt 算出來的表在 `dbt`；dbt 的表可以整批重建，不會碰到原始資料。
 
 一句話記法：`.yml` 的 `schema` 是資料夾，`public` 就是你既有表所在的資料夾；資料庫名交給 `profiles.yml`，表名寫在 `tables` 底下。
 
@@ -2213,7 +2259,7 @@ model 會列出所在資料夾，但 `ref` 只需要 `stg_loans`；source 要兩
 
 核對依據：三個範例在 2026-11-11 用本機 Youbike/.venv-dbt（dbt-core 1.12.6、dbt-postgres 1.11.0）連 youbike_test 實跑，用的是暫時的示範 schema，跑完已刪除。本筆記不增加驗收完成數。
 
-### 2026-11-12：view、staging 和資料庫上下游的關係
+### 2026-11-12：view、staging 和資料庫上下游的關係；materialized 決定建出什麼，view 和 table 差在哪
 
 問題：staging（`stg_youbike_snapshot`）只是原樣 select，為什麼要有它？下游不是一樣要改？DB 約束不是已經會抓錯？view 是不是 cache？是不是為了資安？大家要資料是不是去敲 staging，再由它連 DB？
 
@@ -2285,7 +2331,95 @@ view 最核心的目的是讓「看到的資料樣子」和「實際怎麼存」
 
 核對依據：範例在 2026-11-12 用本機 Youbike/.venv（psycopg）與 .venv-dbt（dbt-core 1.12.6、dbt-postgres 1.11.0）連 youbike_test 實跑，用的是暫存表與暫時的示範 schema，跑完已刪除。staging 不寫 tests 的決定見 HTML 的 D14、D15 列。本筆記不增加驗收完成數。
 
-### 2026-11-13：staging、intermediate、mart 怎麼分工，需求來了改哪一層
+#### dbt 預設把 model 建成 view；materialized 決定建出什麼（2026-11-17 補）
+
+model 的 `.sql` 檔裡只寫 `SELECT`。「把結果存成什麼」的那句 SQL 是 dbt 自己包在外面的；沒寫 `config(materialized=...)` 時，預設建成 **view**。
+
+例如 `mart_station_hourly.sql` 只寫了 `Select ... from int`，2026-11-17 build 時 dbt 實際送出的 SQL（在 `dbt/target/run/` 裡）是：
+
+```text
+create view "youbike_test"."dbt"."mart_station_hourly__dbt_tmp"
+as (
+  Select station_id,slot_hour,max_rent_bikes, ...
+from "youbike_test"."dbt"."int_station_hourly_availability"
+);
+```
+
+`create view ... as (` 是 dbt 加的；`__dbt_tmp` 是暫時名字，建好後 dbt 會改回 `mart_station_hourly`。
+
+`materialized` 只管這個 model **自己被建成什麼**。它從哪裡讀資料，看的是 `FROM` 裡的 `ref()`／`source()`，跟 `materialized` 無關。同一段 `select 'apple' as name, 3 as qty`，四種值實跑的結果：
+
+| `materialized` | dbt 送出的 SQL | Postgres 裡出現的東西 |
+|---|---|---|
+| 不寫（預設 view） | `create view ...` | `VIEW` |
+| `'table'` | `create table ...` | `BASE TABLE` |
+| `'incremental'`（第一次跑） | `create table ...` | `BASE TABLE` |
+| `'ephemeral'` | 不送任何 SQL | 什麼都沒有 |
+
+- **table、incremental：** 存的是跑出來的每一列資料。第一次跑兩者看起來一樣，差別在之後再跑的時候（任務 4）。
+- **ephemeral：** 不在資料庫建任何東西；下游 model 用到它時，dbt 把它的 SELECT 直接嵌進下游的 SQL。
+
+核對依據：mart 的 SQL 讀自 2026-11-17 15:53 build 留下的 `dbt/target/run/youbike/models/marts/mart_station_hourly.sql`；四種值在測試庫的暫存專案實跑（dbt 1.12.6），Postgres 類型查自 `information_schema.tables`，跑完已刪除。ephemeral 嵌進下游是 dbt 的既定行為，這次沒有另外實跑下游。本筆記不增加驗收完成數。
+
+#### view 和 table 怎麼運作、差在哪（2026-11-17 補）
+
+| | view | table |
+|---|---|---|
+| 資料庫裡存什麼 | 只存那段 SELECT 的文字 | SELECT 跑出來的每一列資料 |
+| SELECT 什麼時候跑 | 每次有人查它的時候 | dbt build 的時候跑一次 |
+| 來源有新資料時 | 下次查詢就看得到 | 看不到，要重新 build 才會更新 |
+| 查詢的成本 | 每次都從來源重算一遍，資料越多越慢 | 直接讀存好的列，很快 |
+| build 的成本 | 只存文字，很快，跟資料量無關 | 要把整段 SELECT 跑完，資料越多越慢 |
+| 佔用空間 | 幾乎不佔 | 每一列都存在磁碟上 |
+
+**實測：** 兩個 model 的 SELECT 完全一樣，只差 table 那個檔案第一行多了 `{{ config(materialized='table') }}`：
+
+```sql
+select shop, sum(amount) as total
+from {{ source('demo', 'sales') }}
+group by shop
+```
+
+來源表 `sales` 先放兩筆（100、50），接著依序操作：
+
+```text
+## 1. dbt run (sales: 100, 50)
+   1 of 2 OK created sql table model demo_vt.shop_total_table .. [SELECT 1 in 0.13s]
+   2 of 2 OK created sql view model demo_vt.shop_total_view .. [CREATE VIEW in 0.05s]
+## 2. query both
+    view | A | 150
+    table | A | 150
+## 3. insert 30 into sales, no dbt run, query both
+    view | A | 180
+    table | A | 150
+## 4. EXPLAIN (what Postgres does when you query each)
+  -- view:
+    HashAggregate  (cost=29.05..31.05 rows=200 width=40)
+      Group Key: sales.shop
+      ->  Seq Scan on sales  (cost=0.00..22.70 rows=1270 width=36)
+  -- table:
+    Seq Scan on shop_total_table  (cost=0.00..22.00 rows=1200 width=40)
+## 5. dbt run again, query both
+    view | A | 180
+    table | A | 180
+## 6. what is stored
+    shop_total_view |  SELECT shop, sum(amount) AS total FROM demo_vt.sales GROUP BY shop;
+    sales | 3
+    shop_total_table | 1
+```
+
+- **第 3 步：** 來源多了 30，沒有重跑 dbt。view 馬上變成 180，table 還停在 150，因為 table 存的是上次 build 那一刻的結果。
+- **第 4 步：** 查 view 時，Postgres 實際上是去掃 `sales` 再分組加總（`HashAggregate`、`Seq Scan on sales`），也就是把 SELECT 重跑一遍；查 table 只是把存好的列讀出來（`Seq Scan on shop_total_table`）。
+- **第 5 步：** 再跑一次 dbt，table 重新跑了整段 SELECT（`SELECT 1` 表示寫入 1 列），這時才變成 180。
+- **第 6 步：** view 在資料庫裡只有一段定義文字；table 真的存了 1 列資料。
+
+**放回 YouBike：** 目前 staging、int、mart 都是 view，所以每查一次 mart，Postgres 都要從 `response` 的全部列重新分組計算。好處是重播寫進來的資料，下次查詢就看得到；壞處是 `response` 每 30 分鐘就多一批，查詢會越來越慢。任務 4 把 mart 改成表（增量），就是為了不用每次重算；代價是表要重新 build 才會更新。
+
+**怎麼選：** 業界常見的做法是，輕量的整理層（例如 staging）用 view；會被頻繁查詢、計算又重的 mart 存成 table 或 incremental。
+
+核對依據：上面的輸出是 2026-11-17 在測試庫的暫存專案實跑（dbt 1.12.6）；查詢計畫用 `EXPLAIN`，儲存內容查自 `pg_views` 與 `pg_stat_user_tables`，跑完已刪除。第 6 步的 view 定義原本分成四行，這裡合成一行。本筆記不增加驗收完成數。
+
+### 2026-11-13：staging、intermediate、mart 怎麼分工，需求來了改哪一層；mart 怎麼寫
 
 問題：`mart_station_hourly` 看起來和 `int_station_hourly_availability` 一模一樣，為什麼還要 mart？intermediate 是不是一個來源一張、mart 才整合多來源？一張 intermediate 該放多少、事先怎麼知道要做哪些、新需求來了改哪一層？
 
@@ -2382,7 +2516,7 @@ count after aggregating:     [('amy', 1), ('ben', 1)]
 
 核對依據：規格 4.3、D15／D18／D56／D57 的現行內容與 2026-11-13 拿掉 sample_count、coverage 的定案；計數範例在 youbike_test 用暫存表實跑一次；dbt 指南與 Kimball 是業界一般做法的整理，不是本專案文件。本筆記不增加驗收完成數。
 
-### 2026-11-13：mart 怎麼寫、mart.yml 放什麼、ref 和 source 怎麼寫
+#### mart 怎麼寫、mart.yml 放什麼、ref 和 source 怎麼寫（2026-11-13 補）
 
 問題：現在 intermediate 和 mart 會不會完全一樣，是不是 copy & paste？那 mart.yml 是不是就不需要了？`from ref('int_station_hourly_availability')` 這樣寫對嗎？dbt 裡是不是 source 兩層、之後就直接找檔名？
 
@@ -2390,7 +2524,7 @@ count after aggregating:     [('amy', 1), ('ben', 1)]
 
 （ref 與 source 的寫法併到〈dbt 為什麼用 source() 讀表〉一節；mart.yml 放什麼併到〈dbt 的 yml 怎麼對上 SQL〉一節。）
 
-#### mart 不是 copy & paste
+##### mart 不是 copy & paste
 
 - **不要做的：** 把 intermediate 的 `GROUP BY` 和 `min()`、`max()`、`avg()` 整段複製到 mart。分組規則會有兩份，改一邊漏一邊就對不上。
 - **還會直接出錯：** intermediate 輸出的欄位是 `slot_hour`、`min_rent_bikes`、`avg_rent_bikes` 這些，已經沒有 `slot_time`、`available_rent_bikes`。mart 如果照抄原本的計算，會報「欄位不存在」（2026-11-13 14:10 的存檔就是這樣）。
@@ -2404,7 +2538,7 @@ select
 from {{ ref('int_class_avg') }}
 ```
 
-#### 現在 mart 可以和 intermediate 不一樣的地方
+##### 現在 mart 可以和 intermediate 不一樣的地方
 
 1. **台北時間的顯示欄位：** 規格寫「小時區間為 UTC `[hour,hour+1h)`，台北顯示轉 Asia/Taipei」。intermediate 照 UTC 分小時；mart 是給人看的那層，可以多一欄台北時間。
 
@@ -2446,7 +2580,7 @@ models:
 
 #### 2. 資料流：每層讀上一層，也會改變資料
 
-`response` → `stg_youbike_snapshot` → `int_station_hourly_availability` → `mart_station_hourly`。每個 model 用 `ref()`／`source()` 讀上一層。建成 view 時只存查詢、不存資料，查下游時才一路往上讀到 `response`。每一層不只過濾：staging 改名、統一型別，intermediate 把一站一次的採樣彙總成一站一小時。
+`response` → `stg_youbike_snapshot` → `int_station_hourly_availability` → `mart_station_hourly`。每個 model 用 `ref()`／`source()` 讀上一層。每一層不只過濾：staging 改名、統一型別，intermediate 把一站一次的採樣彙總成一站一小時。
 
 #### 3. 三種檢查，時間點不同
 
@@ -2533,13 +2667,13 @@ where not (min_fee <= avg_fee and avg_fee <= max_fee)
 
 核對依據：範例都在 Youbike/.venv-dbt（dbt-core 1.12.6、dbt-postgres 1.11.0）對 youbike_test 另開 schema 實跑，跑完已刪除；manifest 檢查是 2026-11-12 對 Andrew 當時的 yml 執行 `dbt parse`。本筆記不增加驗收完成數。
 
-## 2026-11-13：dbt unit test 的 yml 每個欄位怎麼寫
+### 2026-11-13：dbt unit test 的 yml 每個欄位怎麼寫；YAML 的 `-` 代表清單裡的一項
 
 問題：寫任務 3 的手算對帳時，`unit_tests` 底下的 `name`、`model`、`given`、`expect` 各是什麼？`.yml` 是不是都用 `models:` 開頭？`expect` 要寫幾筆？
 
 結論：**`.yml` 最上層的 key 決定這一段在描述什麼，檔名不重要。unit test 寫在 `unit_tests:` 底下，每個測試由 `name`、`model`、`given`、`expect` 四塊組成：dbt 用 `given` 的假資料取代被測 model 讀的上游，跑那個 model 的 SQL，再和 `expect` 裡你手算的答案比對，一樣就 PASS。**
 
-### 最上層的 key
+#### 最上層的 key
 
 依本機 dbt 1.12.6 原始碼（`dbt/parser/schemas.py`），除了可省略的 `version`，共有 14 個：
 
@@ -2549,11 +2683,11 @@ where not (min_fee <= avg_fee and avg_fee <= max_fee)
 | 知道有、用到再查 | `data_tests`、`seeds`、`snapshots`、`macros`、`exposures` | 自訂 SQL 測試的說明；專案內的小 CSV；記錄資料隨時間的變化（SCD2）；可重用的 SQL 片段；誰在用這些資料（例如儀表板） |
 | 聽過就好 | `analyses`、`groups`、`functions`、`metrics`、`semantic_models`、`saved_queries` | 這個專案用不到 |
 
-- `version: 2` 只是格式版本標記，dbt 1.5 之後可以省略；寫或不寫都能跑，全專案統一一種就好。
+- `version: 2` 見〈sources.yml 是做什麼的〉一則的「version: 2」；寫或不寫，全專案統一一種就好。
 - 一個檔可以同時放好幾個 key，例如上面 `models:`、下面 `unit_tests:`。
 - `dbt_project.yml`（專案設定）和 `profiles.yml`（連線設定）不在這套規則裡。
 
-### unit test 的四個欄位
+#### unit test 的四個欄位
 
 | 欄位 | 寫什麼 | 注意 |
 |---|---|---|
@@ -2562,7 +2696,7 @@ where not (min_fee <= avg_fee and avg_fee <= max_fee)
 | `given` | 一個清單；每一項有 `input`（被測 model 直接讀的 `ref(...)` 或 `source(...)`）和 `rows`（手寫的假資料） | `input` 不一定是最源頭，是被測 model 的 SQL 裡寫的那個；`rows` 只寫 model 有用到的欄位，其他欄位 dbt 自動補 NULL；時間要帶時區，例如 `"2026-11-13 09:00:00+00"` |
 | `expect` | `rows`：你預期 model 輸出的每一列 | 一筆＝輸出的一列；欄位名稱要和 SQL 輸出一樣；可以只寫要比對的欄位；順序不用和輸出一樣；值要從 `given` 手算 |
 
-### 範例（圖書館情境，2026-11-09 在 youbike_test 實跑）
+#### 範例（圖書館情境，2026-11-09 在 youbike_test 實跑）
 
 ```yaml
 version: 2
@@ -2589,7 +2723,7 @@ PASS latest_loan::latest_loan_picks_newest_time
 
 2026-11-13 另跑了一次：`expect` 兩筆的順序和輸出相反，而且少寫一個輸出欄位 `loan_count`，結果還是 `PASS member_fees::member_fees_reversed_rows_partial_columns`。所以順序不影響，沒寫的欄位不比對。
 
-### expect 要寫幾筆
+#### expect 要寫幾筆
 
 `expect` 是測資的正確答案。它的筆數不用自己決定，由 `given` 決定：`given` 裡有幾個「一站×一小時」的組合，`expect` 就有幾筆。
 
@@ -2609,29 +2743,29 @@ PASS latest_loan::latest_loan_picks_newest_time
 - 同站下一個小時：分小時有沒有切對，10:00 不能算進 09 時。
 - 另一站：分站有沒有分開。
 
-### 常見錯誤
+#### 常見錯誤
 
 1. **先跑 SQL 再把輸出抄進 `expect`。** 這樣不管 SQL 對錯都會過，等於沒測。答案一定要從 `given` 手算。
 2. **時間沒帶時區。** 照 UTC 分小時時，可能整整差 8 小時。
 3. **contract 把 avg 寫成 integer。** 手算 4.5，輸出被當成整數就對不起來。
 4. **`input` 寫錯。** model 讀 `ref(...)` 卻在 `given` 寫 `source(...)`，或反過來。
 
-### 相關問答
+#### 相關問答
 
-- **model 是什麼：** model 是一支 SELECT，加上 dbt 幫你把結果存成表或 view。你只寫 SELECT，dbt 送進資料庫時會包成 `create view ... as (select ...)`，名稱就是檔名，並把 `{{ source(...) }}`、`{{ ref(...) }}` 換成真實表名。
-- **分層：** staging 跟原始表一對一，只整理欄位；intermediate 放計算邏輯；mart 給使用者查。照分層，intermediate 應該讀 `ref('stg_...')` 而不是直接讀原始表，這樣原始表變動只改 staging，staging 的 tests 也才保護得到下游。
+- **model 是什麼：** 見〈view、staging 和資料庫上下游的關係〉一則的「dbt 預設把 model 建成 view」。
+- **分層：** 見〈staging、intermediate、mart 怎麼分工〉一則。
 
 一句話記法：`given` 是假的輸入，`expect` 是手算的答案；dbt 只測一個 model，用假輸入取代它直接讀的上游。
 
 核對依據：最上層 key 依本機 dbt 1.12.6 的 `dbt/parser/schemas.py`；`latest_loan` 範例 2026-11-09 在 youbike_test 實跑 PASS；順序與部分欄位那次是 2026-11-13 另跑的，也是 PASS；兩次都用暫存 schema，跑完已刪除。本筆記不增加驗收完成數。
 
-## 2026-11-13：YAML 的 `-` 代表清單裡的一項
+#### YAML 的 `-` 代表清單裡的一項（2026-11-13 補）
 
 問題：unit test 的 `given` 只有一個 input，為什麼前面還要加 `-`？
 
 結論：**`-` 在 YAML 裡代表「清單裡的一項」。dbt 規定某些欄位一定要是清單，因為那裡可能有好幾個；就算只有一個，也要寫成「只有一項的清單」。少了 `-`，dbt 讀不懂，`dbt parse` 會直接報錯。**
 
-### 有沒有 `-`，讀出來差在哪
+##### 有沒有 `-`，讀出來差在哪
 
 同一段 YAML，用 dbt 環境裡的 YAML 讀法實跑：
 
@@ -2662,7 +2796,7 @@ Parsing Error
   Invalid unit_tests config given in ... member_open_fees.yml
 ```
 
-### unit test 裡出現三次
+##### unit test 裡出現三次
 
 | 位置 | 為什麼是清單 |
 |---|---|
@@ -2672,7 +2806,7 @@ Parsing Error
 
 `models:` 底下的 `- name:`、`columns:` 底下的 `- name:`、`sources:` 底下的 `- name:` 也是同一個規則。
 
-### 縮排
+##### 縮排
 
 `-` 後面那一項的其他 key 要和 `-` 後的第一個 key 對齊，例如：
 
@@ -2689,96 +2823,7 @@ given:
 
 核對依據：兩種寫法的讀法用 `.venv-dbt` 的 PyYAML 實跑；少了 `-` 的錯誤訊息是 2026-11-13 在暫存範例專案跑 `dbt parse` 得到的（dbt 1.12.6），跑完已還原。本筆記不增加驗收完成數。
 
-### 2026-11-17：dbt 預設把 model 建成 view；materialized 決定建出什麼
-
-model 的 `.sql` 檔裡只寫 `SELECT`。「把結果存成什麼」的那句 SQL 是 dbt 自己包在外面的；沒寫 `config(materialized=...)` 時，預設建成 **view**。
-
-例如 `mart_station_hourly.sql` 只寫了 `Select ... from int`，2026-11-17 build 時 dbt 實際送出的 SQL（在 `dbt/target/run/` 裡）是：
-
-```text
-create view "youbike_test"."dbt"."mart_station_hourly__dbt_tmp"
-as (
-  Select station_id,slot_hour,max_rent_bikes, ...
-from "youbike_test"."dbt"."int_station_hourly_availability"
-);
-```
-
-`create view ... as (` 是 dbt 加的；`__dbt_tmp` 是暫時名字，建好後 dbt 會改回 `mart_station_hourly`。
-
-`materialized` 只管這個 model **自己被建成什麼**。它從哪裡讀資料，看的是 `FROM` 裡的 `ref()`／`source()`，跟 `materialized` 無關。同一段 `select 'apple' as name, 3 as qty`，四種值實跑的結果：
-
-| `materialized` | dbt 送出的 SQL | Postgres 裡出現的東西 |
-|---|---|---|
-| 不寫（預設 view） | `create view ...` | `VIEW` |
-| `'table'` | `create table ...` | `BASE TABLE` |
-| `'incremental'`（第一次跑） | `create table ...` | `BASE TABLE` |
-| `'ephemeral'` | 不送任何 SQL | 什麼都沒有 |
-
-- **view：** 資料庫只存那段 SELECT 的文字，有人查它時才當下重跑。
-- **table、incremental：** 存的是跑出來的每一列資料。第一次跑兩者看起來一樣，差別在之後再跑的時候（任務 4）。
-- **ephemeral：** 不在資料庫建任何東西；下游 model 用到它時，dbt 把它的 SELECT 直接嵌進下游的 SQL。
-
-核對依據：mart 的 SQL 讀自 2026-11-17 15:53 build 留下的 `dbt/target/run/youbike/models/marts/mart_station_hourly.sql`；四種值在測試庫的暫存專案實跑（dbt 1.12.6），Postgres 類型查自 `information_schema.tables`，跑完已刪除。ephemeral 嵌進下游是 dbt 的既定行為，這次沒有另外實跑下游。本筆記不增加驗收完成數。
-
-### 2026-11-17：view 和 table 怎麼運作、差在哪
-
-| | view | table |
-|---|---|---|
-| 資料庫裡存什麼 | 只存那段 SELECT 的文字 | SELECT 跑出來的每一列資料 |
-| SELECT 什麼時候跑 | 每次有人查它的時候 | dbt build 的時候跑一次 |
-| 來源有新資料時 | 下次查詢就看得到 | 看不到，要重新 build 才會更新 |
-| 查詢的成本 | 每次都從來源重算一遍，資料越多越慢 | 直接讀存好的列，很快 |
-| build 的成本 | 只存文字，很快，跟資料量無關 | 要把整段 SELECT 跑完，資料越多越慢 |
-| 佔用空間 | 幾乎不佔 | 每一列都存在磁碟上 |
-
-**實測：** 兩個 model 的 SELECT 完全一樣，只差 table 那個檔案第一行多了 `{{ config(materialized='table') }}`：
-
-```sql
-select shop, sum(amount) as total
-from {{ source('demo', 'sales') }}
-group by shop
-```
-
-來源表 `sales` 先放兩筆（100、50），接著依序操作：
-
-```text
-## 1. dbt run (sales: 100, 50)
-   1 of 2 OK created sql table model demo_vt.shop_total_table .. [SELECT 1 in 0.13s]
-   2 of 2 OK created sql view model demo_vt.shop_total_view .. [CREATE VIEW in 0.05s]
-## 2. query both
-    view | A | 150
-    table | A | 150
-## 3. insert 30 into sales, no dbt run, query both
-    view | A | 180
-    table | A | 150
-## 4. EXPLAIN (what Postgres does when you query each)
-  -- view:
-    HashAggregate  (cost=29.05..31.05 rows=200 width=40)
-      Group Key: sales.shop
-      ->  Seq Scan on sales  (cost=0.00..22.70 rows=1270 width=36)
-  -- table:
-    Seq Scan on shop_total_table  (cost=0.00..22.00 rows=1200 width=40)
-## 5. dbt run again, query both
-    view | A | 180
-    table | A | 180
-## 6. what is stored
-    shop_total_view |  SELECT shop, sum(amount) AS total FROM demo_vt.sales GROUP BY shop;
-    sales | 3
-    shop_total_table | 1
-```
-
-- **第 3 步：** 來源多了 30，沒有重跑 dbt。view 馬上變成 180，table 還停在 150，因為 table 存的是上次 build 那一刻的結果。
-- **第 4 步：** 查 view 時，Postgres 實際上是去掃 `sales` 再分組加總（`HashAggregate`、`Seq Scan on sales`），也就是把 SELECT 重跑一遍；查 table 只是把存好的列讀出來（`Seq Scan on shop_total_table`）。
-- **第 5 步：** 再跑一次 dbt，table 重新跑了整段 SELECT（`SELECT 1` 表示寫入 1 列），這時才變成 180。
-- **第 6 步：** view 在資料庫裡只有一段定義文字；table 真的存了 1 列資料。
-
-**放回 YouBike：** 目前 staging、int、mart 都是 view，所以每查一次 mart，Postgres 都要從 `response` 的全部列重新分組計算。好處是重播寫進來的資料，下次查詢就看得到；壞處是 `response` 每 30 分鐘就多一批，查詢會越來越慢。任務 4 把 mart 改成表（增量），就是為了不用每次重算；代價是表要重新 build 才會更新。
-
-**怎麼選：** 業界常見的做法是，輕量的整理層（例如 staging）用 view；會被頻繁查詢、計算又重的 mart 存成 table 或 incremental。
-
-核對依據：上面的輸出是 2026-11-17 在測試庫的暫存專案實跑（dbt 1.12.6）；查詢計畫用 `EXPLAIN`，儲存內容查自 `pg_views` 與 `pg_stat_user_tables`，跑完已刪除。第 6 步的 view 定義原本分成四行，這裡合成一行。本筆記不增加驗收完成數。
-
-### 2026-11-17：incremental 怎麼運作：第一次建表，之後只寫進 SELECT 選出來的列
+### 2026-11-17：incremental 怎麼運作、watermark 是什麼，D16 用寫入時間找新資料
 
 **一句話：** incremental 第一次跑和 table 一樣，`create table ... as (SELECT)`；之後每次跑都**不重建表**，而是先把 SELECT 的結果放進暫存表（`__dbt_tmp...`），再照設定的方式寫進原本的表。**哪些列算新的，dbt 不會自己判斷，完全由你寫的 SELECT 決定。**
 
@@ -2899,13 +2944,13 @@ group by e.shop
 
 核對依據：上面的輸出是 2026-11-17 在測試庫的暫存專案實跑（dbt 1.12.6），跑完已刪除；log 的執行秒數已拿掉，run 1 的 SQL 只節錄開頭。兩個限制的錯誤訊息出自同日另一個暫存專案的實跑。本筆記不增加驗收完成數。
 
-### 2026-11-17：watermark 是什麼：記錄「資料處理到哪裡」的那條線
+#### watermark 是什麼：記錄「資料處理到哪裡」的那條線（2026-11-17 補）
 
-#### 定義
+##### 定義
 
 watermark（水位線）是一個記錄「資料已經處理到哪裡」的值，用來劃分「處理過」和「還沒處理」的資料。下一次執行只處理超過這條線的資料，處理完再把線往後移。名字來自河岸或船身上標示「水曾經漲到這裡」的那條線：只會往上移，不會往回退。
 
-#### 三個要點，對照 YouBike 的 mart
+##### 三個要點，對照 YouBike 的 mart
 
 | 要點 | 在 YouBike（Andrew 2026-11-17 存檔） |
 |---|---|
@@ -2915,7 +2960,7 @@ watermark（水位線）是一個記錄「資料已經處理到哪裡」的值�
 
 watermark 不是另外一張表，也不是存在別處的變數，而是每次執行時才從 mart 表裡算出來；mart 一更新，下一次算出來的值就跟著往後移。
 
-#### 實際的值
+##### 實際的值
 
 2026-11-17 在 youbike_test 查到：
 
@@ -2933,28 +2978,28 @@ hours a run would touch: 1
 
 晚到資料的例子（同日在 scratchpad 副本模擬）：替站點 00123 最舊的小時（09/27 08:00）補一筆晚到的樣本，它的 `ingested_at` 是當下時間，比 watermark 新，所以下一次 build 選到了這個小時：log 是 `INSERT 0 2`，這個小時從 max 7、avg 7 重算成 max 17、avg 12，`last_ingested_at` 從 10/24 變成 11/17 19:55。
 
-#### 為什麼 `slot_time` 不能當 watermark
+##### 為什麼 `slot_time` 不能當 watermark
 
-晚到的資料 `slot_time` 比較舊。例如 09:30 的資料，在 dbt 已經處理到 10:00 之後才寫進 `response`。如果用「`slot_time` 大於上次的最大值」來篩，09:30 永遠比 10:00 小，會一直被篩掉；mart 那個小時永遠少一筆，而且 `dbt build` 照樣全過、不會報錯。`ingested_at` 記的是寫入時間，晚到的資料寫入時間反而比較新，所以篩得到。
+見下面 D16 那段的「為什麼不能用「`slot_time` 大於上次的最大值」」。
 
-#### 容易搞混：串流系統的 watermark
+##### 容易搞混：串流系統的 watermark
 
 Spark、Flink 這類串流系統裡的 watermark 是另一個意思：指「等晚到資料最多等到哪個時間點」，過了就不再等。YouBike 現在用的是批次處理的這一種。
 
 核對依據：定義與對照整理自 2026-11-17 D16 問答；watermark 的值是同日在 youbike_test 實際查到的；晚到樣本是助理在 scratchpad 副本的一次性模擬，跑完已刪除，沒有改 Andrew 的檔案。本筆記不增加驗收完成數。
 
-### 2026-11-17：D16 增量要用寫入時間找新資料，不能用 slot_time；舊的小時一樣會被更新
+#### D16 增量要用寫入時間找新資料，不能用 slot_time；舊的小時一樣會被更新（2026-11-17 補）
 
-**一句話：** `ingested_at`（或已處理批次清單）決定「哪些資料是新的」，`slot_time` 決定「新資料屬於哪個小時」。incremental 本身怎麼運作、watermark 是什麼，見同日前兩則（「incremental 怎麼運作」與「watermark 是什麼」）。
+**一句話：** `ingested_at`（或已處理批次清單）決定「哪些資料是新的」，`slot_time` 決定「新資料屬於哪個小時」。
 
-#### 兩個時間欄位
+##### 兩個時間欄位
 
 | 欄位 | 意思 | 用在哪一步 |
 |---|---|---|
 | `slot_time` | 這筆資料描述的是哪一次採樣的車況 | 決定它屬於哪個小時 |
 | `ingested_at` | 這筆資料什麼時候寫進 `response` | 決定它算不算新資料 |
 
-#### 為什麼不能用「`slot_time` 大於上次的最大值」
+##### 為什麼不能用「`slot_time` 大於上次的最大值」
 
 - **問題不在擷取層：** 重播（D11）把 09:30 的資料寫進 `response`，這一步是對的。問題在 dbt 層：增量 model 每次都要判斷 `response` 裡哪些列還沒算進 mart。
 - **會不會出錯，要看順序：**
@@ -2989,7 +3034,7 @@ rows returned: 1
 
 A 一筆都沒選到，只有 B 選到晚到的那筆。
 
-#### 舊的小時也會被更新：用整個小時重算，靠 key 換掉
+##### 舊的小時也會被更新：用整個小時重算，靠 key 換掉
 
 用 `ingested_at` 選到晚到的 09:30 那筆之後：
 
@@ -2997,7 +3042,7 @@ A 一筆都沒選到，只有 B 選到晚到的那筆。
 2. **用這個小時全部的樣本重算：** 09:00 的 3 台＋09:30 的 6 台 → avg 4.5、min 3、max 6。只用新的那筆算會得到 avg 6，是錯的；直接再加一列，會變成同一站同一小時兩列，grain 壞掉。平均值沒辦法只靠新資料更新。
 3. **換掉舊列：** `unique_key`（站點＋小時）加 `delete+insert`，先刪掉 mart 裡 X／09 點的舊列（avg 3），再插入新列。靠 key 對上，不管這個小時是多久以前。
 
-#### 每次跑的三步（網店範例，停在 run 2 那一刻）
+##### 每次跑的三步（網店範例，停在 run 2 那一刻）
 
 輸入有兩樣：`orders` 共 4 筆，最後一筆是 11/01 的 30 元、11/04 才載入；上一次建好的表共 3 列，每列都存著 `last_loaded_at`。
 
@@ -3012,7 +3057,7 @@ A 一筆都沒選到，只有 B 選到晚到的那筆。
 - **第一次跑為什麼是全量：** 第 2 步的 `where` 包在 `{% if is_incremental() %}` 裡，表還不存在時不會加上去，所有 key 都被選到（`SELECT 3`）。
 - **對應到專案：** `orders` → staging、`loaded_at` → `ingested_at`、「店＋日」→「站點＋小時」（小時用 `slot_time` 算）、`last_loaded_at` → mart 要多加的那一欄。
 
-#### 要不要做（依現行文件）
+##### 要不要做（依現行文件）
 
 - **要，這就是 D16：** HTML 的 D16 寫「選新 ingestion 批次，不按 observed_at 最大值丟晚到資料」（`observed_at` 是 11/10 改名前的 `slot_time`）；spec 寫「正式驗收需具備 incremental model：只選新增 ingestion 批次，重新算所有受影響 station-hour」。
 - **哪些一定要：** 第 2、3 步一定要。第 1 步「記住上次處理到哪」二選一，由 Andrew 決定：mart 多存一欄最大的 `ingested_at`（watermark 欄），或另外記下已處理的 `batch_id`（批次清單，mart 就不用多一欄）。
@@ -3034,7 +3079,7 @@ A 一筆都沒選到，只有 B 選到晚到的那筆。
 | int 的資料 | 假的：模擬「這次跑時查 int 會得到的結果」 | `input: ref('int_station_hourly_availability')` |
 | mart 的上一版 | 假的：模擬「上次跑完那一刻查 mart 會得到的結果」 | `input: this` |
 
-- **`input`：** 被測的 SQL 從哪裡讀資料。SQL 讀幾個地方就給幾個；底下的列用那個來源的欄位，只寫用得到的欄位，沒寫的是 NULL。
+- **`input`：** 見〈dbt unit test 的 yml 每個欄位怎麼寫〉一則 `given` 那一列。
 - **dbt 怎麼換：** 把 `{{ref(...)}}`、`{{this}}` 換成這些假資料，編譯後變成 `__dbt__cte__int_station_hourly_availability`、`__dbt__cte__mart_station_hourly`。不讀真表的資料，只讀真表的欄位型別，所以第一次跑之前 mart 表要先存在。
 - **一定要給 `this`：** 開了 `is_incremental: true` 卻不給，讀設定時就報錯，整個 dbt 都跑不了：`Unit test ... for incremental model 'mart_station_hourly' must have a 'this' input`。
 
@@ -3046,7 +3091,7 @@ A 一筆都沒選到，只有 B 選到晚到的那筆。
 | `int_station_hourly_availability` | 改跑 int 的 SQL；int 讀 stg，但沒給 stg 的假資料，所以 ERROR：`depends on a node named 'stg_youbike_snapshot' which was not found` |
 | 不存在的名字 | Parsing Error：`Unable to find model ...` |
 
-yml 和 .sql 靠名字配對，yml 的檔名不重要。build 輸出 `mart_station_hourly::測試名` 裡，`::` 前面就是 model。
+build 輸出 `mart_station_hourly::測試名` 裡，`::` 前面就是 model，後面是 unit test 的 `name`。
 
 #### watermark 怎麼比：一次一批，不是一筆一筆
 
@@ -3085,8 +3130,6 @@ yml 和 .sql 靠名字配對，yml 的檔名不重要。build 輸出 `mart_stati
 | 重跑沒有新資料 | 不寫（2026-11-18 Andrew 決定） | mart 每次用 int 的完整結果 delete+insert，沒有新資料時重跑必然一樣；重播和全量是否一致，由對帳測試每次 build 驗證 |
 | 缺的小時不補 | 不寫，改用證據（2026-11-18 Andrew 決定） | 補 0 或抄上一小時會做出假資料（漏抓看 `run_status`，11/13 定案）。但 int 用 GROUP BY，只替有樣本的小時產生列，專門寫的測試在現行程式下永遠不會失敗。證據：A 站只有 09:10、11:20 兩筆樣本，實跑結果只有 09:00、11:00 兩列；測試庫有樣本的站點小時 54,643 個，mart、int 也各 54,643 列（11/17 查），之後由對帳測試每次 build 確認 |
 | 對帳 | `dbt/tests/` 新增 .sql，兩個方向的 `except`，0 列才 PASS。2026-11-18 Andrew 決定：每次 build 只比最近 2 天有樣本寫入的小時（用 `ingested_at` 找、含重播的舊小時，撈這些小時的全部樣本重算），另每 30 天一次全量 | 增量篩選寫錯，mart 和全量結果對不上；只比最近 2 天是為了資料變大時每次 build 的時間固定 |
-
-unit test 用假資料驗證篩選規則；對帳測試則是每次 build 拿真實資料整張比。
 
 **2026-11-18 補充：** 助理一度代寫「重跑沒有新資料」的 unit test：等於 watermark 的那列和第一個測試的邊界列重複；比 watermark 舊的那列守的是「只處理新資料」（就算壞了，結果仍然正確，只是變成每次全部重算），跟重跑正確與否無關。Andrew 說「一樣規則下重跑一定是完全一樣」，判定多餘，已拿掉。D17 剩缺小時不補與對帳兩個測試。同日 Andrew 再決定，缺小時不補也不另寫測試，改用上表的證據，**D17 只剩對帳測試**。
 
@@ -3152,3 +3195,280 @@ unit test 用假資料驗證篩選規則；對帳測試則是每次 build 拿真
 - **全量對帳平常不跑（2026-11-18 採用）：** 全量測試檔第一行寫 `{{ config(tags=['monthly']) }}`；`dbt/selectors.yml` 的預設選擇器 `default_build` 排除 `tag:monthly`，所以沒加參數的 `dbt build` 不會跑它；要跑時用 `dbt test --select tag:monthly`。用 `--select` 指定範圍時預設選擇器不套用，要自己加 `--exclude tag:monthly`。
 
 核對依據：本則數字都是 2026-11-18 在 youbike_test 實跑（唯讀查詢、EXPLAIN，以及 scratchpad 副本的獨立 schema，跑完已刪）；30 天全量的時間是推算，沒在正式庫跑。決定（每次 2 天、每 30 天全量；重播與缺小時不另寫 unit test）已同步到兩份 HTML 和三份 md。
+
+### 2026-11-23：D19 的假來源表：`like` 照抄欄位、`schema.表` 的點號、`drop schema … cascade`
+
+**一句話：** 假來源表放在自己的 schema，用 `create table 假schema.表 (like 來源表)` 照抄欄位（不抄資料、預設值和約束），再改掉一欄名字模擬來源改版；fixture 建好要 commit，dbt 才看得到；測完用 `drop schema 假schema cascade` 連同裡面的表一起刪，`public` 不受影響。
+
+問題（Andrew 11/23 依序問）：在獨立 schema 建一張欄位改名的表、測完刪掉，給個範例？`drop schema` 會不會砍到 `public`？可以這樣建 `XXX.XXX` 嗎，中間的點 SQL 怎麼看待？`yield conn` 要不要加引號？`cascade` 的用途和 `like public.response` 的用法？
+
+#### 範例：fixture 建假來源表（網店情境，`orders` 的 `amount` 改名成 `total`）
+
+```python
+@pytest.fixture
+def fake_orders(test_conn):
+    test_conn.execute("drop schema if exists fixture_shop cascade")   # 上次沒清乾淨也能重跑
+    test_conn.execute("create schema fixture_shop")
+    test_conn.execute("create table fixture_shop.orders (like public.orders)")
+    test_conn.execute("alter table fixture_shop.orders rename column amount to total")
+    test_conn.commit()           # dbt 用另一條連線，只看得到 commit 過的表
+    yield "fixture_shop"         # 測試拿到 schema 名稱，之後交給 --vars
+    test_conn.execute("drop schema fixture_shop cascade")
+    test_conn.commit()
+```
+
+- **`(like 來源表)`：** 照抄欄位，抄了什麼見下一節。
+- **`commit()` 一定要有：** dbt 會開自己的連線，看不到沒 commit 的表；`conftest.py` 的 `test_conn` 收尾時還會 `rollback()`，沒 commit 的東西最後都會被撤掉。
+- **`yield`：** 之前是準備，之後是收尾；測試失敗也照樣收尾。
+- **開頭的 `drop schema if exists`：** 上次跑到一半當掉、沒走到收尾，這次照樣能重新建立，符合「測試要能反覆執行」。
+- **`yield conn` 不加引號，`yield "fixture_shop"` 加引號：** 不加引號是變數名稱，交出變數裡裝的東西（conftest 交出的是連線物件）；加引號是一段文字，這裡要交出的就是 schema 的名字。實跑：`yield conn -> dict {...}`、`yield "conn" -> str 'conn'`。
+
+SQL 實跑（youbike_test，全部在最後撤銷的交易裡；外面那層 pytest fixture 沒有另外跑）：
+
+```text
+## demo_fixture.orders columns: [('shop', 'text'), ('order_day', 'date'), ('total', 'integer'), ('loaded_at', 'timestamp with time zone')]
+## model query: UndefinedColumn - column "amount" does not exist
+## other connection sees demo_fixture before commit: 0
+## after drop schema ... cascade: 0
+```
+
+- 第 2 行：還在讀舊欄位名的查詢會直接報錯，stg 讀到假表時就是這樣建不起來。
+- 第 3 行：commit 之前，另一條連線看不到這個 schema。
+
+#### `create table … (like 來源表)` 抄了什麼
+
+用 `public.response` 實跑（youbike_test，PostgreSQL 16.13，最後撤銷）：
+
+```text
+## column names and types same as source: True | columns: 14
+## NOT NULL same as source: True
+## defaults  source: [('id', "nextval('response_id_seq'::regclass)"), ('ingested_at', 'now()')]
+##           like: [] | like ... including all: [('id', "nextval('response_id_seq'::regclass)"), ('ingested_at', 'now()')]
+## constraints (p=primary key, u=unique, f=foreign key, c=check, n=not null)
+##   source: [('c', 10), ('f', 3), ('p', 1), ('u', 2)] | like: [] | including all: [('c', 10), ('p', 1), ('u', 2)]
+## rows copied by like: 0 (source has 63700 )
+```
+
+| 項目 | `(like 來源表)` | `(like 來源表 including all)` |
+|---|---|---|
+| 欄位名稱、型別 | 抄 | 抄 |
+| NOT NULL | 抄 | 抄 |
+| 預設值（`id` 的流水號、`ingested_at` 的 `now()`） | 不抄 | 抄 |
+| CHECK、主鍵、唯一約束 | 不抄 | 抄 |
+| 外鍵 | 不抄 | 也不抄 |
+| 資料 | 不抄（0 筆） | 不抄 |
+
+- **假來源表用不加選項的 `like` 就夠：** 只要欄位對得上，讓 stg 讀得到（或讀不到改名的那欄），約束和預設值都用不到。
+- **建好之後和來源表沒有關聯：** 之後改來源表，假表不會跟著變；刪假表也不會動到來源表。
+- **`including all` 會共用流水號：** `id` 的預設值照抄成 `nextval('response_id_seq')`，假表新增資料時，會用掉正式表的流水號。假來源表不需要它。
+
+#### `cascade` 的用途
+
+`drop schema` 預設是 `restrict`：schema 裡還有東西就拒絕刪。加上 `cascade`，才會連同裡面的東西一起刪。
+
+```text
+## drop schema without cascade: DependentObjectsStillExist - cannot drop schema demo_like because other objects depend on it
+## drop schema with cascade, schema still exists: 0
+```
+
+`cascade` 刪的範圍是 schema 裡的所有物件，**加上建在這些物件上面的其他物件，就算它們在別的 schema**（例如一個查假表的 view）。`public` 本身和裡面的表不會被刪：
+
+```text
+## notices from drop: ['drop cascades to 2 other objects']
+## public.response still exists: True
+## public.response rows before / after: 63700 / 63700
+## demo_other.v (built on the fake table) still exists: False
+```
+
+- **對 D19：** stg 建不起來，就沒有東西建在假表上，刪 schema 只刪假表。
+- **改錯欄位的風險：** 如果改名的是 stg 沒讀的欄位，stg 會成功改建成讀假表；這時刪假 schema，會連 `dbt.stg_youbike_snapshot` 和建在它上面的 int view 一起刪。`public` 的資料不受影響，下次正常 build 也會重建，但測試就沒測到要的情況。所以要改 stg 真的有讀的欄位，並在測試裡確認第二次 dbt 的結束碼不是 0。
+- **唯一要避免的寫法：** 讓 `drop schema` 後面的名字變成 `public`。假 schema 的名稱寫死，就不會發生。
+
+#### `schema.表` 的點號
+
+| 寫法 | PostgreSQL 怎麼看 |
+|---|---|
+| `demo_a.t` | `demo_a` 這個 schema 裡的 `t` 表 |
+| `t`（沒有點） | 照 `search_path`（預設 `"$user", public`）依序找，通常落在 `public` |
+| `youbike_test.demo_a.t` | 資料庫.schema.表；資料庫只能是目前連上的那個 |
+
+```text
+## create table demo_x.t before the schema exists:
+   InvalidSchemaName - schema "demo_x" does not exist
+## same table name, two schemas: demo_a.t rows = 1 | demo_b.t rows = 2
+## search_path: "$user", public
+## no prefix -> created in schema: public
+## three parts, same database: 2
+## three parts, another database:
+   FeatureNotSupported - cross-database references are not implemented: "other_db.demo_b.t"
+```
+
+- **schema 要先存在：** 所以 fixture 要先 `create schema`，再建表。
+- **同名的表可以放在不同 schema：** 資料各自分開，所以假來源表也能叫 `response`，不會碰到 `public.response`。
+- **沒寫點號：** 見〈sources.yml 是做什麼的〉一則的「public 是哪來的」。
+- **三段寫法：** dbt 編譯出來的 `"youbike_test"."dbt"."mart_station_hourly"` 就是三段；PostgreSQL 不能跨資料庫查。
+
+核對依據：各段 SQL 輸出都是 2026-11-23 在 youbike_test（PostgreSQL 16.13）實跑，全部在最後 rollback 的交易裡，沒有留下任何物件；`yield` 的對照是 scratchpad 裡的獨立 pytest；網店範例的 fixture 本身沒有另外跑。範例用網店情境，不是 D19 的答案；換成自己的專案時，來源表是 `response`，改哪一欄由 Andrew 決定。
+
+### 2026-11-23：D19 dbt 失敗時誰會知道：結束碼、測試照樣往下跑、Airflow 標 failed
+
+**一句話：** dbt 是另一個程式，失敗不會變成 Python 的例外，只會用結束碼 1 告訴呼叫它的人。誰看這個結束碼，誰就知道失敗了：D19 測試用 `assert` 看，正式環境由 Airflow 看。
+
+問題（Andrew 11/23 依序問）：dbt 出錯是 raise 嗎？`result_2` 出錯後測試還能繼續跑嗎？改欄位預期會錯，怎麼驗證是這個錯？pipeline 出錯還會繼續跑，正式環境出錯不就不知道？
+
+#### dbt 失敗時，Python 這邊拿到什麼
+
+```text
+## no check -> no exception, returncode = 1 | stdout = model failed
+## check=True -> raised CalledProcessError | e.returncode = 1
+```
+
+（2026-11-23 實跑：用一支印一行、回傳 1 的小程式代替 dbt。）
+
+- **預設不 raise：** `subprocess.run(...)` 照常回傳 `CompletedProcess`，失敗只寫在 `.returncode`，程式繼續跑下一行。
+- **加 `check=True` 才 raise：** 結束碼不是 0 就丟 `CalledProcessError`。D19 第 3 步本來就預期失敗，所以不加，或用 `pytest.raises` 包住。
+- **會讓測試停下來的只有兩種：** `check=True` 丟出例外，或某個 `assert` 不成立。
+
+#### 驗證是「這個錯」，不是別的錯
+
+光看 `returncode != 0` 只知道有東西失敗；連不上資料庫、`--vars` 打錯也一樣不是 0。dbt 會把資料庫回的錯誤原文印到 stdout，用 `in` 檢查：
+
+```python
+r = subprocess.run([sys.executable, "failing_job.py"], capture_output=True, text=True)
+assert r.returncode != 0
+assert 'column "available_rent_bikes" does not exist' in r.stdout
+```
+
+```text
+returncode: 1
+stdout    : Database Error in model stg_demo: column "available_rent_bikes" does not exist
+both asserts passed
+```
+
+（2026-11-23 實跑：`failing_job.py` 照 dbt 的樣子，對一個沒有該欄位的子查詢做唯讀查詢，失敗就印錯誤、回傳 1。）
+
+- **要找的欄位名稱：** 是假表改名前的「原本名字」，因為 stg 用原本的名字去找。
+- **另一個做法：** 讀 dbt 寫的 `dbt/target/run_results.json`，每個 model 或測試各有一筆 `unique_id` 和 `status`。每跑一次 dbt 就會覆蓋，所以要在第 3 步跑完馬上讀。失敗時的 `error`、`skipped` 狀態，本筆記沒有實際產生過。
+
+#### 「繼續跑」指的是誰
+
+| 在哪裡 | 誰看結束碼 | dbt 失敗時會怎樣 |
+|---|---|---|
+| D19 測試 | `assert result_2.returncode != 0` | 預期結果，測試接著查 mart 比較；dbt 竟然成功時，這行讓測試 FAIL |
+| 正式環境（任務 5） | Airflow | task 標成 failed（紅色），後面的 task 不跑，畫面上看得到 |
+
+dbt 本身沒有「當作沒事」：上游失敗時下游 SKIP，結束時回 1。正式環境那一列，D20 的咖啡店示範用 BashOperator 跑 dbt 實跑過：
+
+```text
+## cafe_bad
+   2 of 3 FAIL 1 unique_orders_store_order_day ................. [FAIL 1 in 0.04s]
+   3 of 3 SKIP relation demo_cafe2.store_day ................... [SKIP]
+   Command exited with return code 1
+   task state -> failed
+```
+
+這就是 D20 驗收的「失敗狀態可見」，不用另寫檢查。之後還有任務 5 的新鮮度檢查和 Phase 7 D46 的本機 alert 會主動通知，這兩樣都還沒做。D19 要證明的是另一半：失敗的那段期間，mart 裡的資料是安全的。
+
+核對依據：前兩段的輸出是 2026-11-23 在 scratchpad 實跑（只有一次唯讀查詢，沒有寫資料庫）；Airflow 那段取自 D20 session 2026-11-18 的實跑輸出；新鮮度檢查與 D46 alert 尚未實作。
+
+### 2026-11-23：沒 commit 的 `alter table` 會鎖住整張表：dbt 跟著等，測試整個卡住
+
+**一句話：** `alter table` 一執行就拿到整張表最強的鎖 `AccessExclusiveLock`，一直拿到這個交易 commit 或 rollback 才放；在那之前，別的連線連 `select` 都要排隊。測試改完表要先 commit，再叫 dbt。
+
+問題：D19 測試（2026-11-23 16:34 存檔）在 fixture 建好假表並 commit 之後，test 裡再用 `alter table … rename` 改欄位名，沒有 commit 就呼叫 dbt。會發生什麼？
+
+#### 範例：兩條連線，A 改欄位名不 commit，B 去讀（youbike_test 實跑，跑完已刪）
+
+```python
+a = psycopg.connect(dsn)                    # 一般連線：要自己 commit
+b = psycopg.connect(dsn, autocommit=True)   # 另一條連線，代表 dbt
+a.execute("alter table notes_lock_demo.t rename old_name to new_name")   # 沒有 commit
+b.execute("set lock_timeout = '2s'")        # 只是為了示範：等 2 秒就放棄
+b.execute("select * from notes_lock_demo.t")
+a.commit()
+b.execute("select * from notes_lock_demo.t")
+```
+
+```text
+## A: alter table notes_lock_demo.t rename old_name to new_name  (not committed)
+## B: locks on notes_lock_demo.t: [('AccessExclusiveLock', True)]
+## B: select with lock_timeout 2s -> LockNotAvailable - canceling statement due to lock timeout
+## A: commit
+## B: select again -> columns = ['id', 'new_name'] | rows = [(1, 'x')]
+```
+
+- **`AccessExclusiveLock`：** B 從 `pg_locks` 查到 A 拿著這把鎖（`True` 代表已經拿到）。它是 PostgreSQL 最強的鎖，和其他所有鎖都衝突，所以連只讀的 `select` 都要等。改名、加減欄位、`drop table` 都會拿這種鎖。
+- **B 被擋下：** 這裡設了 `lock_timeout` 才會在 2 秒後放棄並報錯；dbt 的連線沒有設，會一直等下去。
+- **commit 之後：** A 放掉鎖，B 馬上讀得到，看到的已經是改名後的欄位。
+
+#### 為什麼 D19 測試會整個卡住，而不是報錯
+
+| 誰 | 在做什麼 | 在等什麼 |
+|---|---|---|
+| 測試的連線（`test_conn`） | 改完欄位名，交易還沒結束，手上拿著整張表的鎖 | 等 `subprocess.run` 叫的 dbt 跑完 |
+| dbt（另一個程式、另一條連線） | 要讀這張表來建 stg | 等測試的連線放掉鎖 |
+
+兩邊互相等，誰都不會先結束。PostgreSQL 會偵測死結，但只看得到資料庫裡連線之間的互等；這裡測試那一邊是在等一個程式（dbt）跑完，資料庫看不出來，所以不會報錯，只會一直卡著。
+
+#### D19 測試裡怎麼避免
+
+- **改完表先 commit，再呼叫 dbt；** 或把改名放進 fixture，跟建表一起 commit。
+- **和同日上一則「dbt 看不到沒 commit 的表」是同一個原因：** 交易結束前，改動對別的連線不可見，改表拿的鎖也還沒放掉。
+- **（選用）不想讓測試無限等：** `subprocess.run(..., timeout=秒數)` 超時會拋 `TimeoutExpired`，測試會失敗，不會卡住。
+
+核對依據：範例在 2026-11-23 於 youbike_test 實跑（自建 `notes_lock_demo` schema，跑完已刪）；同日檢查 D19 時另一次實跑（`lock_timeout` 2 秒）也得到同樣的 `canceling statement due to lock timeout`。`timeout=` 那一點依 Python 文件，這次沒有實跑。
+
+### 2026-11-23：`--vars` 的值是 YAML，冒號後面要空一格
+
+**一句話：** dbt 用 YAML 讀 `--vars` 的字串。YAML 的「鍵: 值」冒號後面一定要有空格；寫成 `{test_schema:test_schema}`，會變成一個叫 `test_schema:test_schema`、值是空的鍵，`test_schema` 根本沒設到，`var('test_schema','public')` 就默默用預設值 `public`，而且 dbt 不會報錯。
+
+問題：D19 測試（2026-11-23 16:34 存檔）第 33 行寫 `run_dbt("--vars","{test_schema:test_schema}")`，想讓 `sources.yml` 的 `schema: "{{var('test_schema','public')}}"` 改讀假表所在的 `test_schema`。為什麼沒換過去？要怎麼寫？
+
+#### 範例 1：同一串字，有沒有空格，dbt 讀出來完全不同（dbt 自己的解析函式，實跑）
+
+```python
+from dbt.config.utils import parse_cli_vars    # dbt 處理 --vars 用的就是這個函式
+for s in ['{test_schema:test_schema}', '{test_schema: test_schema}', '{"test_schema":"test_schema"}']:
+    print(f"{s!r:34} -> {parse_cli_vars(s)}")
+```
+
+```text
+'{test_schema:test_schema}'        -> {'test_schema:test_schema': None}
+'{test_schema: test_schema}'       -> {'test_schema': 'test_schema'}
+'{"test_schema":"test_schema"}'    -> {'test_schema': 'test_schema'}
+```
+
+- **第一行（沒空格）：** 整串 `test_schema:test_schema` 被當成一個鍵，值是 `None`，所以沒有任何一個叫 `test_schema` 的變數。
+- **第二行（冒號後面有空格）：** 才是你要的：鍵 `test_schema`，值 `test_schema`。
+- **第三行（JSON 寫法）：** 鍵和值都加了雙引號，冒號後面沒空格也讀得對。JSON 本身就是合法的 YAML。
+
+#### 範例 2：用 dbt compile 看實際讀的是哪張表（實跑，只編譯、不寫資料庫）
+
+```bash
+dbt compile --select stg_youbike_snapshot --vars '{test_schema:test_schema}'
+dbt compile --select stg_youbike_snapshot --vars '{test_schema: test_schema}'
+```
+
+編譯後 `target/compiled/youbike/models/staging/stg_youbike_snapshot.sql` 的 `from` 那一行：
+
+```text
+## --vars '{test_schema:test_schema}'   (exit=0)
+from "youbike_test"."public"."response"
+## --vars '{test_schema: test_schema}'  (exit=0)
+from "youbike_test"."test_schema"."response"
+```
+
+- **沒空格的那次照樣成功（exit=0）：** 多一個用不到的變數，dbt 不會提醒你，只會用預設值 `public`。所以 D19 的第二次 dbt 還是讀真的 `response`，stg 照常建好，故障情境根本沒發生。
+- **想確認變數有沒有換到：** 跑一次 `dbt compile`，看編譯出來的 `from` 那一行 schema 名，最直接。
+
+#### 為什麼冒號後面要空格
+
+YAML 在 `{ }` 裡，要「冒號＋空格」才代表鍵和值的分隔；冒號後面緊接文字，冒號會被當成文字的一部分，跟網址 `http://` 裡的冒號一樣，所以整串變成一個鍵。JSON 寫法因為鍵有雙引號，引號一結束 YAML 就知道鍵到這裡為止，冒號後面不空格也行。
+
+#### 解法
+
+- **冒號後面加一個空格：** `{test_schema: test_schema}`；或改用 JSON 寫法 `{"test_schema": "test_schema"}`。
+- **在 `subprocess.run` 的清單裡：** 整串是清單裡的一個元素，不用另外加引號，例如 `["--vars", "{test_schema: test_schema}"]`。
+- **在 shell 裡：** 要用單引號把整串包起來，例如 `--vars '{test_schema: test_schema}'`。不包的話，shell 會在空格處把它切成兩個參數。
+
+核對依據：範例 1 用 `.venv-dbt` 的 dbt 1.12.6 實跑 `parse_cli_vars`；範例 2 在 scratchpad 的 dbt 專案副本實跑 `dbt compile`（只編譯，沒有寫入資料庫），兩者都是 2026-11-23。同日檢查 D19 時，在副本照「冒號後面有空格」實跑過一次：stg ERROR、其餘 6 個 SKIP、結束碼 1，mart 列數和 watermark 都沒變。
