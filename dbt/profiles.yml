@@ -1,7 +1,16 @@
 youbike:
-  target: test
+  target: production
   outputs:
-    test:
+    production:
+      type: postgres
+      threads: 1
+      host: "{{ env_var('YOUBIKE_DATABASE_HOST') }}"
+      port: "{{ env_var('YOUBIKE_DATABASE_PORT') | int }}"
+      user: "{{ env_var('YOUBIKE_DATABASE_USER') }}"
+      password: "{{ env_var('YOUBIKE_DATABASE_PASSWORD') }}"
+      dbname: "{{ env_var('YOUBIKE_DATABASE_NAME') }}"
+      schema: production_dbt
+    main_test:
       type: postgres
       threads: 1
       host: "{{ env_var('YOUBIKE_TEST_DATABASE_HOST') }}"
@@ -10,3 +19,12 @@ youbike:
       password: "{{ env_var('YOUBIKE_TEST_DATABASE_PASSWORD') }}"
       dbname: "{{ env_var('YOUBIKE_TEST_DATABASE_NAME') }}"
       schema: dbt
+    error_test:
+      type: postgres
+      threads: 1
+      host: "{{ env_var('YOUBIKE_TEST_DATABASE_HOST') }}"
+      port: "{{ env_var('YOUBIKE_TEST_DATABASE_PORT') | int }}"
+      user: "{{ env_var('YOUBIKE_TEST_DATABASE_USER') }}"
+      password: "{{ env_var('YOUBIKE_TEST_DATABASE_PASSWORD') }}"
+      dbname: "{{ env_var('YOUBIKE_TEST_DATABASE_NAME') }}"
+      schema: test_dbt

@@ -7,6 +7,7 @@ stg_youbike_snapshot as (
     select *
     from {{ref('int_station_hourly_availability')}}
 )
+-- if return 0 means pass
 (select *
 from mart_station_hourly m
 except
