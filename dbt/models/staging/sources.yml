@@ -9,6 +9,11 @@ sources:
           - name: batch_id
           - name: slot_time
       - name: response
+        config:
+          loaded_at_field: response.ingested_at
+          freshness:
+            warn_after: { count: 90, period: minute }
+            error_after: { count: 3, period: hour }
         columns:
           - name: id
           - name: batch_id
