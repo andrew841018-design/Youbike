@@ -816,6 +816,7 @@ def test_expired_without_raw_is_missing(youbike_test_env,controlled_raw_http_ser
 
 - 重試由 Airflow 負責：`retries=4`（最多 5 次），退避約 66、171、324、600 秒，600 秒上限實際生效；Python 只做單次。
 - `retry_count` 用模板 `{{ ti.try_number - 1 }}` 傳進產品，模板算完是字串，寫入前用 `int()`；`op_kwargs` 的 key 要和函式參數名稱對上，對不上的會被默默丟掉。
+- 用 Airflow 跑 dbt 靠 `BashOperator`：`bash_command` 是一段交給終端機跑的文字，不是 function；dbt 程式（`.venv-dbt/bin/dbt`）用標籤找到 `dbt/tests/` 裡自己寫的 SQL，Airflow 看結束碼判斷成敗。每個檔的 `dag_id` 不能重複：重複時只會留下一個，沒有錯誤也沒有警告（2026-11-24）。
 - 排程對帳：`generate_series` 列出應該有的 slot，再用 `NOT EXISTS` 找出缺的；缺口記成 missing（2026-11-10 起由 `record_missing` 寫入）。
 
 ### 2026-10-08 D10：Airflow有限重試的實際證據
@@ -1229,6 +1230,129 @@ with psycopg.connect(dsn, autocommit=True) as conn:
 一句話記法：`generate_series` 列出應該有的時間，`AS expect(slot)` 替它取名，`expect.slot` 拿這個時間去別的表比對。
 
 核對依據：範例都在本機 Youbike/.venv（Python 3.9.6）獨立執行，要在 `Youbike/` 底下跑才讀得到 `.env`；連 youbike_test（PostgreSQL 16.13），只用暫存表。第 2～5 點的訊息和結果也是同一環境實跑。兩個缺口來自 2026-11-04 下午的正式庫查詢，這次沒有重查。本筆記不增加 D12 驗收完成數。
+
+### 2026-11-24：每月對帳 DAG：BashOperator 跑的是一行指令，怎麼跑到自己寫的測試
+
+**一句話：** 這個 DAG 檔只決定「什麼時候跑、跑哪一行指令」。指令啟動 dbt 程式，dbt 用標籤找到 `dbt/tests/` 裡自己寫的 SQL 去跑，Airflow 看結束碼決定 success 或 failed。
+
+問題（Andrew 11/24 依序問）：每月對帳的 DAG 怎麼寫？`Retry_Policy` 那個 class 要留嗎？`test --select tag:...` 要放哪裡？這個檔在做什麼，bash 指令怎麼呼叫到對應的 function？dbt 不是資料夾嗎？排程不是應該跑我開發的測試嗎？
+
+#### 從 Airflow 到自己寫的 SQL
+
+1. 到了 `schedule` 的時間，Airflow 執行 `bash_command` 那段文字，和自己在終端機手打一樣。
+2. 指令啟動 dbt 程式（`.venv-dbt/bin/dbt`）。
+3. dbt 到 `--project-dir` 的 `tests/` 找貼了 `monthly` 標籤的檔，也就是 `mart_station_hourly_reconcile_full.sql`。
+4. dbt 把 `{{ref(...)}}` 換成真正的表名，其餘一字不差，送到正式庫。
+5. 查到 0 列回結束碼 0，task 是 success；查到任何一列回 1，task 是 failed（判斷規則見第 7 主題 D17 那則）。
+
+#### BashOperator 沒有呼叫 function
+
+| | 寫什麼 | Airflow 做什麼 |
+|---|---|---|
+| `PythonOperator`（realtime 的擷取） | `python_callable=extract_youbike` | 呼叫 Python function |
+| `BashOperator`（dbt） | `bash_command="..."` | 把這段文字交給終端機跑 |
+
+從專案的 DAG 印出 Airflow 實際拿到的值，型別是 `str`（路徑縮寫）：
+
+```text
+set -a; . <Youbike>/.env; set +a; <Youbike>/.venv-dbt/bin/dbt test --select tag:monthly --target production --project-dir <Youbike>/dbt --profiles-dir <Youbike>/dbt
+```
+
+| 這一段 | 意思 |
+|---|---|
+| `set -a; . .../.env; set +a;` | 把 `.env` 載進來，dbt 的 `env_var` 才讀得到連線設定 |
+| `.../.venv-dbt/bin/dbt` | 要執行的程式 |
+| `test` | 只跑測試，不建表 |
+| `--select tag:monthly` | 只跑貼了這個標籤的測試 |
+| `--target production` | 用 profiles.yml 的哪一組連線 |
+| `--project-dir`、`--profiles-dir` | dbt 專案和 profiles.yml 在哪個資料夾 |
+
+DAG 檔裡寫成三段 f-string，中間沒有逗號，Python 會接成一行；`{youbike_root}` 換成專案路徑。
+
+#### 兩個都叫 dbt：資料夾和程式
+
+| | `Youbike/dbt/` | `Youbike/.venv-dbt/bin/dbt` |
+|---|---|---|
+| 是什麼 | 資料夾，自己寫的 dbt 專案 | 檔案，dbt 程式，pip 安裝時產生 |
+| `ls -ld` | `drwxr-xr-x`（`d`＝資料夾） | `-rwxr-xr-x`（`x`＝可以執行） |
+
+程式檔只有 6 行，真正被呼叫的 function 是 dbt 自己的 `cli()`，`sys.exit(...)` 把結果變成結束碼：
+
+```python
+from dbt.cli.main import cli
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(cli())
+```
+
+- **和 pytest 一樣：** `python -m pytest` 是工具，`tests/unit/test_*.py` 是自己寫的測試；`.venv-dbt/bin/dbt test` 是工具，`dbt/tests/*.sql` 是自己寫的測試。
+- 直接執行資料夾會得到 `permission denied: ./dbt`。
+
+#### 標籤寫在兩個地方
+
+| 地方 | 寫什麼 | 作用 |
+|---|---|---|
+| 測試檔第 1 行 | `{{config(tags=['monthly'])}}` | 替這個測試貼標籤 |
+| `bash_command` 裡 `dbt` 的後面 | `test --select tag:monthly` | 只跑貼了標籤的測試 |
+
+寫進 `DAG(...)` 的括號會變成語法錯誤：那裡只能放 `名字=值` 的 Python 參數，`test --select ...` 是終端機指令。
+
+#### 範例：咖啡店每週盤點（獨立 Airflow 3.3.2 實跑）
+
+```python
+with DAG(
+    dag_id="cafe_weekly_stocktake",
+    schedule="15 4 * * 1",
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    catchup=False,
+    max_active_runs=1,
+):
+    BashOperator(
+        task_id="full_stocktake",
+        bash_command=f"set -a; . {ENV}; set +a; {DBT} test --select tag:weekly --project-dir {PROJECT} --profiles-dir {PROJECT}",
+    )
+```
+
+```text
+## 帳面和實際一致
+Found 2 data tests
+1 of 1 PASS stocktake_full
+Command exited with return code 0
+DagRun state=success
+## 實際少一杯（指令多加 --vars '{lost_one: true}'）
+1 of 1 FAIL 2 stocktake_full
+Command exited with return code 1
+DagRun state=failed
+```
+
+`FAIL 2`：帳面 `(mocha, 3)` 和實際 `(mocha, 2)` 各多出一列。
+
+#### schedule 的五欄
+
+依序是分、時、幾號、月、星期幾，`*` 代表每一個。DAG 的 `start_date` 用 UTC，所以時間是 UTC，台北要加 8 小時。
+
+| schedule | 意思 | 從 11/24 06:00 UTC 起算的三次 |
+|---|---|---|
+| `*/30 * * * *` | 每 30 分鐘 | 11/24 06:30、07:00、07:30 |
+| `15 4 * * 1` | 每週一 04:15 | 11/30、12/07、12/14 |
+| `30 2 1 * *` | 每月 1 號 02:30 | 12/01、01/01、02/01 |
+
+每月對帳的分鐘要避開 `:00`、`:30`：新一批剛進來時，int 是 view，馬上看得到新資料，mart 卻還沒更新，對帳會誤報不一致。這一點是照邏輯推的，沒有實測。
+
+#### 容易踩到的
+
+- **`dag_id` 重複：** 複製 realtime DAG 當每月 DAG 的起點時，要先改 `dag_id` 再改其他地方。兩個檔用同一個 `dag_id`，獨立 Airflow 實跑的結果是沒有 import error、沒有 warning，只留下一個，而且每次重新讀檔會互換：
+
+```text
+## 兩個檔第一次被讀到     -> 留下 */30 * * * *
+## 重存每 30 分鐘那個檔   -> 留下 15 4 1 * *
+## 再重存每月那個檔       -> 留下 */30 * * * *
+```
+
+- **`Retry_Policy` 不用留：** 它只認 `requests` 的錯誤（Timeout、ConnectionError、HTTP 429 和 5xx），其他一律不重試。dbt 失敗時 `BashOperator` 丟的是 `airflow.sdk.exceptions.AirflowException: Bash command failed. The command returned a non-zero exit code 1.`，掛上去也沒有作用。
+- **新 DAG 預設暫停：** 專案的 `airflow.cfg` 是 `dags_are_paused_at_creation = True`，要在 UI 打開開關，排程才會跑。
+
+核對依據：咖啡店範例、`dag_id` 互換都是 2026-11-24 在 scratchpad 的獨立 Airflow（SQLite）實跑，沒有碰專案的 Airflow；`bash_command` 的值、dbt 程式檔內容、`airflow.cfg` 設定是當天讀專案檔案得到的；cron 的時間用 croniter 算出來。
 
 ## 6. Pydantic 來源模型
 
@@ -2024,8 +2148,12 @@ same object: False
 - 測失敗情境用假來源表：放在自己的 schema（`schema.表`），用 `(like 來源表)` 照抄欄位（不抄資料、預設值、約束），fixture 建好要 commit，dbt 的連線才看得到；`drop schema … cascade` 連同 schema 裡的東西和建在它上面的物件一起刪，不動 `public`（D19，2026-11-23）。
 - 沒 commit 的 `alter table` 會拿著整張表最強的鎖（`AccessExclusiveLock`），別的連線連 `select` 都要等到它 commit；測試改完表要先 commit 再叫 dbt，否則測試等 dbt、dbt 等鎖，整個卡住（2026-11-23）。
 - `--vars` 的字串是 YAML：`鍵: 值` 的冒號後面要空一格；寫成 `{a:b}` 會變成一個叫 `a:b`、值是空的鍵，變數根本沒設到，`var()` 默默用預設值，dbt 不會報錯。`subprocess.run` 的清單裡整串當成一個元素就好，在 shell 裡要用單引號把整串包起來（D19，2026-11-23）。
+- 指令：`dbt run` 只建、`dbt test` 只檢查、`dbt build` 照上下游順序邊建邊檢查（沒過就 SKIP 下游）、`dbt show` 只看結果。會不會建表看兩件事：檔案在 `models/`，而且指令是 `run` 或 `build`。全新的資料庫第一次要先 `dbt run` 建出 mart：`dbt build` 會先跑 unit test，而 `input: this` 要表先存在（2026-11-24）。
+- 測試要能在全新的 schema 跑：用 `select to_regclass('schema.表')` 問 mart 在不在（不在回 `None`，不報錯，不用 `FROM`），沒有就先 `run` 再 `build`，有就直接 `build`。不要用查表會不會報錯來判斷：交易裡一句出錯，後面每句都會被拒絕，直到 `rollback`（D19，2026-11-24）。
+- 新鮮度檢查：`dbt source freshness --select source:來源.表` 查那張表最新一筆（`max(loaded_at_field)`）離現在多久；WARN 結束碼 0（task 還是 success），ERROR STALE 結束碼 1。`source` 是固定指令，不是檔案；名字寫在 `models/` 底下任何一個 `.yml`，dbt 全部讀完再用名字找，不用指名檔案。一定要寫 `--select`：預設選擇器選不到來源表，會什麼都沒查就成功（2026-11-24）。門檻寫成 `{count: 數字, period: minute／hour／day}`：`count` 是數字，不是筆數，要用整數（1.5 小時寫 90 分鐘）；少寫其中一個不會報錯，那一級就不會觸發（2026-11-24）。
 - 目前的決定：`coverage` 與 `sample_count` 於 2026-11-13 拿掉（漏抓看 `run_status`）；mart 用 `ref` 讀 intermediate、不重算；新鮮度要不要放 mart 待 Andrew 決定。
 - dbt 失敗不會變成 Python 的例外，只會回傳結束碼 1：`subprocess.run` 預設不 raise（加 `check=True` 才會），D19 用 `assert returncode != 0` 加上錯誤訊息確認；正式環境由 Airflow 看結束碼，把 task 標成 failed。
+- 中斷安全靠交易加 watermark：mart 自己記上次寫到哪（最大的 `last_ingested_at`），整批寫入在同一個交易、最後才 COMMIT，中斷就整批不算、watermark 不動，下次從同一個位置重做；每列各自 commit 會讓 watermark 跳過還沒寫的舊列。delete+insert 管的是另一件事：mart 一小時一列、資料每半小時一批，同一站同一小時會被重寫，先刪再寫才不會變兩列。
 
 ### 2026-11-10：sources.yml 是做什麼的，以及資料庫、schema、表三層名字
 
@@ -3194,6 +3322,29 @@ build 輸出 `mart_station_hourly::測試名` 裡，`::` 前面就是 model，�
 - **看結果：** 寫的時候用 `dbt show --inline "select ... {{ ref(...) }}"` 看任一段 SQL 的結果（預設 5 列，`--limit` 調整）；測試失敗時加 `--store-failures`，失敗的列會存進 `dbt_dbt_test__audit` schema。
 - **全量對帳平常不跑（2026-11-18 採用）：** 全量測試檔第一行寫 `{{ config(tags=['monthly']) }}`；`dbt/selectors.yml` 的預設選擇器 `default_build` 排除 `tag:monthly`，所以沒加參數的 `dbt build` 不會跑它；要跑時用 `dbt test --select tag:monthly`。用 `--select` 指定範圍時預設選擇器不套用，要自己加 `--exclude tag:monthly`。
 
+#### 三種結果、三種測試怎麼算 PASS（2026-11-24 補）
+
+| 發生什麼 | 結果 | 實際遇過的例子 |
+|---|---|---|
+| SQL 跑不起來 | `ERROR` | 正式庫還沒有 mart 表：`ERROR mart_station_hourly_unit_tests` |
+| 跑得起來，查到列 | `FAIL 幾列` | 咖啡店少一杯：`FAIL 2 stocktake_full` |
+| 跑得起來，查到 0 列 | `PASS` | `PASS mart_station_hourly_reconcile_full` |
+
+SQL 沒有錯不等於 PASS，要查到 0 列才算。「0」是 0 列，不是數字 0；同一個條件兩種寫法實跑：
+
+| 寫法 | 查到什麼 | dbt 的結果 |
+|---|---|---|
+| `select * ... where qty < 0` | `[]`，0 列 | `PASS` |
+| `select count(*) ... where qty < 0` | `[(0,)]`，1 列，值是 0 | `FAIL 1` |
+
+| 種類 | 寫什麼 | 怎樣算 PASS |
+|---|---|---|
+| `dbt/tests/*.sql`（對帳） | 找出有問題的列 | 0 列 |
+| yml 的 `data_tests`（grain） | 只寫名字和欄位，SQL 由套件產生 | 一樣是 0 列 |
+| yml 的 `unit_tests`（int、mart） | given 和 expect | 算出來的列和 expect 一樣 |
+
+- **SQL 的註解用 `--`：** `.sql` 檔裡寫 Python 的三個雙引號註解會變成 `Database Error`（11/24 在全量對帳檔第 10 行實際遇到），改成 `-- ...` 後 PASS。
+
 核對依據：本則數字都是 2026-11-18 在 youbike_test 實跑（唯讀查詢、EXPLAIN，以及 scratchpad 副本的獨立 schema，跑完已刪）；30 天全量的時間是推算，沒在正式庫跑。決定（每次 2 天、每 30 天全量；重播與缺小時不另寫 unit test）已同步到兩份 HTML 和三份 md。
 
 ### 2026-11-23：D19 的假來源表：`like` 照抄欄位、`schema.表` 的點號、`drop schema … cascade`
@@ -3472,3 +3623,860 @@ YAML 在 `{ }` 裡，要「冒號＋空格」才代表鍵和值的分隔；冒�
 - **在 shell 裡：** 要用單引號把整串包起來，例如 `--vars '{test_schema: test_schema}'`。不包的話，shell 會在空格處把它切成兩個參數。
 
 核對依據：範例 1 用 `.venv-dbt` 的 dbt 1.12.6 實跑 `parse_cli_vars`；範例 2 在 scratchpad 的 dbt 專案副本實跑 `dbt compile`（只編譯，沒有寫入資料庫），兩者都是 2026-11-23。同日檢查 D19 時，在副本照「冒號後面有空格」實跑過一次：stg ERROR、其餘 6 個 SKIP、結束碼 1，mart 列數和 watermark 都沒變。
+
+### 2026-11-23：寫到一半中斷會怎樣：交易保證全有或全無，watermark 才能放心存在 mart 裡
+
+**一句話：** mart 自己記「上次寫到哪」（最大的 `last_ingested_at`）；整批寫入在同一個交易，中斷就整批不算、watermark 不動，下次從同一個位置重做。delete+insert 管的是另一件事：同一站同一小時重寫時不會變兩列。
+
+問題（Andrew 11/23 傍晚依序問）：資訊怎麼傳、上游根據什麼判斷要寫哪些？寫到一半中斷，mart 是不是接著寫？只記最新一個值，怎麼知道哪些是舊的？這跟 delete+insert 有沒有關係？正常運作為什麼也會重寫？每列各自 commit 為什麼會漏？目前有沒有處理？
+
+#### 資訊怎麼一路傳到 mart
+
+| 層 | 帶著的時間 | 怎麼來的 |
+|---|---|---|
+| `response` | `ingested_at` | 寫入時資料庫自動填；同一批約 1,825 站在同一個交易寫入，值都一樣 |
+| int | `last_ingested_at` | 這個小時所有樣本裡最大的 `ingested_at` |
+| mart | `last_ingested_at` | 照 int 存下來 |
+
+mart 每次開始先查自己最大的 `last_ingested_at`（watermark），再從 int 挑大於或等於它的列。不是上游往下推，而是 mart 自己去問；「寫到哪」就存在 mart 這張表裡，不另外存。
+
+#### dbt 實際跑的 SQL（測試庫最後一次 mart build 的 log）
+
+```text
+from "youbike_test"."dbt"."int_station_hourly_availability"
+    last_ingested_at >= (select max(last_ingested_at) from "youbike_test"."dbt"."mart_station_hourly")
+SQL status: SELECT 1825
+        delete from "youbike_test"."dbt"."mart_station_hourly" as DBT_INTERNAL_DEST
+        where (station_id, slot_hour) in (
+    insert into "youbike_test"."dbt"."mart_station_hourly" (...)
+SQL status: INSERT 0 1825
+On model.youbike.mart_station_hourly: COMMIT
+```
+
+選出要寫的列放進暫存表 → 刪掉同一站同一小時的舊列 → 一句 insert 寫入整批 → 最後一個 COMMIT 才一起生效。
+
+#### 中斷時：不是接著寫，而是整批重做
+
+- COMMIT 之前，別人查 mart 看到的都是舊資料；中途斷掉就整筆取消。mart 沒變，watermark 就沒變，下次從同一個位置把整批重做一次。
+- D19 的失敗情境停得更早：stg 失敗、mart 被 SKIP，上面這段 SQL 根本沒有執行。
+
+#### 只記最新一個值，怎麼分新舊（像書籤）
+
+規則只有一條：大於或等於 watermark 的是新的，這次要處理；小於 watermark 的是舊的，已經處理過了。這條規則成立要靠兩個前提：
+
+1. **寫入時間只會往後走：** 每一批的 `ingested_at` 都比上一批晚。晚到的樣本 `slot_time` 是舊的，但 `ingested_at` 是新的，所以算新資料，這也是不能用 `slot_time` 當 watermark 的原因。
+2. **每次都把 watermark 以後的全部處理完：** 同一個交易，要嘛全寫、要嘛全不寫，所以 watermark 往前移的時候，它前面的一定都處理過了。
+
+#### 反例：每列各自 commit 會漏資料（SQLite 實跑）
+
+mart 原本的 watermark 是 10:00；int 有兩列新的：甲（11:00 這個小時，11:15）、乙（10:30 這個小時，10:45）。寫完甲、還沒寫乙就中斷：
+
+```text
+## one transaction, killed before COMMIT
+   mart rows=2, watermark=10:00 -> next run selects ['11:00', '10:30']
+## each row committed on its own, killed after the first row
+   mart rows=3, watermark=11:15 -> next run selects ['11:00']
+```
+
+- **同一個交易：** 甲一起被取消，watermark 還是 10:00，下次甲、乙都選得到。
+- **各自 commit：** 甲已經生效，watermark 跳到 11:15；乙是 10:45，比它舊，被當成處理過了，永遠不會再被選到。比較新的進去了、比較舊的還沒進去，「比 watermark 舊的都處理過了」就不成立。
+
+#### 交易和 delete+insert 各管什麼
+
+| 問題 | 靠什麼 |
+|---|---|
+| 中斷時會不會看到寫一半的資料、資料會不會漏 | 交易＋watermark |
+| 同一站同一小時被重寫時會不會變兩列 | delete+insert（`unique_key` 是站＋小時） |
+
+dbt 其他增量寫法（append、merge）也一樣包在交易裡；delete+insert 不是「中斷安全」的原因。
+
+#### 正常運作也會重寫：mart 一小時一列，資料每半小時一批
+
+以一站的 10 點那列為例（照 `>=` 規則）：
+
+| 哪次 dbt 跑 | watermark | 這列的 `last_ingested_at` | 選不選 | mart 這列 |
+|---|---|---|---|---|
+| 10:00 那批進來後 | 上一個小時的值 | 10:00:40 | 選 | 新增，1 筆樣本的平均 |
+| 10:30 那批進來後 | 10:00:40 | 10:30:40 | 選 | 換掉，2 筆樣本的平均 |
+| 11:00 那批進來後 | 10:30:40 | 10:30:40 | 選（剛好相等） | 刪掉再寫回，值不變 |
+| 11:30 那批進來後 | 11:00:40 | 10:30:40 | 不選 | 不再動（除非之後又有晚到的樣本） |
+
+- mart 存的是每小時的平均，不是一筆一筆的樣本。新樣本屬於已經存在的小時時，平均只能重算後整列換掉。D17 的 unit test 就是這件事：1 號站 09 點從 6 台（只有 09:30 那筆）換成 4.5 台（加上晚到的 09:00 那筆 3 台）。
+- 證據：每次 build 都會重寫等於 watermark 的那一批（log 裡的 1,825 列），但 mart 一直是 56,468 列。照邏輯，如果只追加，每跑一次就會多 1,825 列重複的資料。
+
+#### 目前有沒有處理
+
+- 每列各自 commit 的情況不會發生：dbt 用一句 insert 寫入整批，刪和寫在同一個交易裡，最後才 COMMIT。
+- 前提是同一時間只有一個擷取在寫（D11 的排他鎖）。`ingested_at` 填的是交易開始的時間，如果兩個擷取同時跑，先開始、後寫完的那一批，時間可能比 watermark 舊。之後要讓擷取平行跑時，要重新檢查這個前提。
+
+#### 面試怎麼答
+
+「如果 dbt 寫 mart 寫到一半中斷，使用者會看到一半的資料嗎？」可以答：「整批寫入在同一個交易裡，COMMIT 之前別人只看得到舊資料，中途斷掉就整批取消。watermark 就是 mart 自己的最大 `last_ingested_at`，寫入沒生效它就不會動，下次從同一個位置重跑。D19 的測試也證明了 build 失敗時，mart 的列數和 watermark 都不變。」（11/23 一開始把原因講成 delete+insert，Andrew 追問後更正：中斷安全靠的是交易，不是 delete+insert。）
+
+核對依據：dbt log 是測試庫 youbike_test 最後一次 mart build 的紀錄（`dbt/logs/dbt.log`）；SQLite 例子在 scratchpad 實跑；「只追加會多 1,825 列」是推論，沒有實跑。
+
+### 2026-11-24：dbt run、test、build、show 差在哪；正式庫第一次要先 dbt run
+
+**一句話：** 差在會不會建表、會不會跑測試；會不會建表要看「檔案」和「指令」兩邊。
+
+問題（Andrew 11/24 依序問）：`dbt build` 和 `dbt test` 差在哪？建表與否是不是和檔案內容有關？如果是純 query，就得用 test 嗎？
+
+#### 四個指令
+
+| 指令 | 建表／view | 跑測試 | 會得到什麼 | 專案哪裡用 |
+|---|---|---|---|---|
+| `dbt run` | 會 | 不會 | `OK created ...` | 正式庫第一次建 mart |
+| `dbt test` | 不會 | 會 | PASS／FAIL／ERROR | 每月對帳 DAG |
+| `dbt build` | 會 | 會，沒過就 SKIP 下游 | 建立和測試照上下游順序穿插 | 每 30 分鐘 DAG |
+| `dbt show` | 不會 | 不會 | 查到的列 | 想看資料時（寫法見 D17 那則） |
+
+- **每 30 分鐘用 `build`：** 有新資料要更新 mart，而且品質沒過就不能更新。
+- **每月用 `test`：** mart 平常已經一直在更新，這裡只要從頭到尾比一次。
+
+#### 會不會建表：檔案和指令都要符合
+
+- **檔案**決定能不能建、建成什麼：`models/` 裡的是 model，`materialized` 決定是 view 還是表；`tests/` 裡的是測試，永遠不會建表。
+- **指令**決定這次要不要建：`run`、`build` 會建，`test` 不會。
+
+| 指令 | 選到什麼 | 建表嗎 | 實際輸出 |
+|---|---|---|---|
+| `dbt run --select mart_station_hourly` | mart | 建 | `OK created sql incremental model ... [INSERT 0 2120970]` |
+| `dbt test --select mart_station_hourly` | 同一個 mart | 沒建 | 3 個 PASS，沒有任何 created |
+| `dbt build --select tag:monthly` | 只有測試檔 | 沒建 | `1 of 1 PASS mart_station_hourly_reconcile_full` |
+
+前兩列選的是同一個 mart，只換指令；第三列的指令會建表，但選到的只有測試檔。
+
+#### 查詢是為了什麼
+
+| 要的是 | 用什麼 |
+|---|---|
+| 檢查對不對 | 寫在 `tests/`，用 `dbt test` |
+| 看一下資料 | `dbt show` |
+| 結果要給別人一直用 | 寫成 model，用 `dbt run`／`build` |
+
+#### 全新的資料庫第一次要先 dbt run
+
+正式庫第一次由排程跑 `dbt build`（11/24 13:30）就卡住：
+
+```text
+5 of 7 ERROR mart_station_hourly::mart_station_hourly_unit_tests
+   Not able to get columns for unit test 'mart_station_hourly' ... because the relation doesn't exist
+6 of 7 SKIP relation production_dbt.mart_station_hourly
+```
+
+- **原因：** mart 的 unit test 用到 `input: this`，要先有 mart 表才跑得了；`dbt build` 會先跑 unit test，沒過就不建 mart。所以在全新的資料庫會每次都失敗。
+- **做法：** 先跑一次 `dbt run --select mart_station_hourly`，它只建表、不跑測試。13:39 在正式庫跑了一次：2,120,970 列、55.96 秒、188 MB，一站一小時一列沒有重複。
+- **之後：** 在正式庫跑和 mart 有關的三個測試全過：全量對帳 47.76 秒、2 天對帳 40.20 秒、unit test 1.06 秒。14:00 的 `dbt build` 裡 unit test 也過了。
+- **還沒解決：** 14:00 那次在更新 mart 時失敗，訊息是 `could not open file "base/16389/t14_182108": Interrupted system call`，是資料庫開檔案失敗，不是 SQL 或測試。mart 和 watermark 都沒動，擷取成功。原因沒有查（Andrew 選先不查）。
+
+核對依據：輸出來自 2026-11-24 的實跑：正式庫的 `dbt run` 由 Andrew 同意後執行一次，其餘在正式庫只跑不寫資料的測試與唯讀查詢；`dbt build --select tag:monthly` 在測試庫跑；13:30、14:00 取自專案 Airflow 的 task log。
+
+### 2026-11-24：D19 測試：全新的 schema 還沒有 mart，先判斷再決定 `run` 或 `build`
+
+**一句話：** 測試先用 `to_regclass` 問 `test_dbt` 有沒有 mart：有就 `build`，沒有就先 `run` 建出來再 `build`。不要用「查表看會不會報錯」來判斷。
+
+問題（Andrew 11/24 依序問）：要不要有條件判斷 mart 存不存在？不判斷的話 `action` 要放 `build` 還是 `run`？`run` 和 `build` 差在哪？先 `run` 後 `build`？至少要判斷第一次吧？每次都跑很沒必要；怎麼知道 mart 在不在，query 看有沒有錯嗎？`to_regclass` 不用 `FROM` 嗎？
+
+#### 為什麼會卡住
+
+D19 加了 `--target error_test` 之後，dbt 寫到 `test_dbt`，這個 schema 一開始沒有 mart。`dbt build` 的第 5 步要先知道 mart 有哪些欄位，mart 卻到第 6 步才建，所以第一次會卡在第 5 步；`dbt run` 沒有第 5 步，建得出來：
+
+| 步驟 | `dbt build` | `dbt run` |
+|---|---|---|
+| 1. 建 stg | 有 | 有 |
+| 2. int 的 unit test | 有 | 沒有 |
+| 3. 建 int | 有 | 有 |
+| 4. grain 測試 | 有 | 沒有 |
+| 5. mart 的 unit test | 有 | 沒有 |
+| 6. 建 mart | 有 | 有 |
+| 7. 2 天對帳 | 有 | 沒有 |
+
+```text
+## schema 裡還沒有 mart
+test_as_saved.py:28: AssertionError: assert 1 == 0
+## 先用 dbt run 建過一次
+1 passed in 10.30s
+```
+
+正式庫 11/24 13:30 也是同一個原因（見上一則「全新的資料庫第一次要先 dbt run」）。
+
+#### 三種做法，Andrew 選「先判斷」
+
+| 做法 | 沒有 mart | 已經有 mart | 差別 |
+|---|---|---|---|
+| 每次都先 `run` | `run` → `build` | `run` → `build` | 不用判斷；每次多跑一趟 dbt |
+| 第一次呼叫直接換成 `run` | `run` | `run` | 不用判斷也不多跑；但不再檢查「正常的 `build` 會全過」 |
+| **先判斷（Andrew 採用）** | `run` → `build` | `build` | 正常那一次永遠是完整的 `build`，和正式排程同一個指令；多一段判斷 |
+
+- **之後都一樣：** 記下 mart 的列數和 watermark → 來源壞掉的 `build` → 再查一次比較。
+- **前兩種為什麼不用判斷：** `dbt run` 自己會看表在不在，不存在就整張建，存在就照增量寫法更新（輸出見同主題 2026-11-17 incremental 那則的 run 1～3）。判斷是為了少跑一趟，不是為了讓結果正確。
+
+`run_dbt` 原本把 `"build"` 寫死，要能跑 `run` 就多收一個參數 `action`。`action` 填什麼，是寫測試的人在每次呼叫時寫上去的（`*extra` 見第 2 主題）：
+
+```python
+def run_shop(action, *extra):
+    cmd = ["echo", "shop", action, "--store", "S1", *extra]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+run_shop("open")
+run_shop("close", "--late")
+```
+
+```text
+shop open --store S1
+shop close --store S1 --late
+```
+
+#### 怎麼問「表在不在」：`to_regclass`
+
+咖啡店例子（測試庫唯讀實跑）：
+
+```python
+for name in ["cafe.orders", "public.response"]:
+    row = conn.execute("select to_regclass(%s)", (name,)).fetchone()
+    found = row[0]
+    print(name, "| row =", row, "| found =", found)
+    if found is None:
+        print("   not there: create it first, then open the shop")
+    else:
+        print("   already there: open the shop")
+```
+
+```text
+cafe.orders | row = (None,) | found = None
+   not there: create it first, then open the shop
+public.response | row = ('response',) | found = response
+   already there: open the shop
+```
+
+| 問的名字 | `fetchone()` |
+|---|---|
+| `no_such_schema.orders`（schema 不存在） | `(None,)` |
+| `public.no_such_table`（表不存在） | `(None,)` |
+| `public.response` | `('response',)` |
+| `test_dbt.mart_station_hourly` | `('test_dbt.mart_station_hourly',)` |
+
+- **不存在不會報錯：** schema 或表不存在都回 NULL，Python 裡是 `None`。
+- **只看 `row[0] is None`，不要比名字：** `public` 在 search_path 裡，回來的名字會省略 schema。
+- **不用 `FROM`：** `FROM` 是要從某張表讀資料才寫；這裡只是呼叫函式，表名是傳進去的一段文字。這種寫法固定回一列，所以 `fetchone()` 一定拿得到東西。
+
+| 寫法 | 問的事 | `FROM` |
+|---|---|---|
+| `select current_database()` | 現在連哪個資料庫 | 不用 |
+| `select to_regclass('cafe.orders')` | 有沒有叫這個名字的表 | 不用 |
+| `select count(*) from cafe.orders` | 這張表有幾列 | 要 |
+
+#### 為什麼不要「查了看會不會錯」
+
+```text
+first query  UndefinedTable - relation "no_such_schema.orders" does not exist
+next query   InFailedSqlTransaction - current transaction is aborted, commands ignored until end of transaction block
+after rollback (1,)
+```
+
+PostgreSQL 的交易裡只要有一句出錯，後面每一句都會被拒絕，直到 `rollback`。第二句只是 `select 1`，一樣失敗。
+
+#### `%s` 的值要放成一組
+
+| 第二個參數 | 結果 |
+|---|---|
+| `"public.response"` | `TypeError: query parameters should be a sequence or a mapping, got str` |
+| `"public.response",`（函式呼叫結尾的逗號） | 同上 |
+| `("public.response")`（只有括號） | 同上 |
+| `("public.response",)` | `('response',)` |
+
+只有最後一種是 tuple：逗號要在自己那層括號裡面。11/24 第 27 行先後遇到第一、二種。
+
+#### 寫的時候注意
+
+- **判斷和正常那一次放在記下「之前」的前面：** 它們造成的變動才不會算進比較。
+- **查的 schema 要和 dbt 寫入的一樣：** `error_test` 寫到 `test_dbt`，測試就查 `test_dbt.mart_station_hourly`。查 `dbt.mart_station_hourly` 的話，前後兩次比的都是沒動過的表，怎麼跑都會過。副本裡故意讓失敗的 `build` 仍寫進一列，舊寫法 PASS，新寫法 FAIL（`56468 == 56469`）。
+- **`run` 的結束碼也要檢查：** 16:48 的存檔裡，`run` 的結果馬上被 `build` 的結果蓋掉，等於沒檢查；`run` 失敗時要到 `build` 才看得到。改不改由 Andrew 決定。
+- **`run` 只放在測試，不放進正式 DAG：** `run` 不跑測試，放在 `build` 前面，有問題的資料會先寫進 mart。
+- **沒有加的檢查：** 記下「之前」時沒有確認列數大於 0。mart 如果是空的，比較會變成 `0 == 0`、`None == None`，照樣 PASS。這是照程式推的，沒有實跑。
+
+#### 結果（11/24 16:48 的存檔，在只連得到測試庫的副本）
+
+| 情況 | 結果 |
+|---|---|
+| 沒有 mart | PASS |
+| 已經有 mart | PASS |
+| 故意弄錯：失敗的 `build` 仍寫進一列 | FAIL：`56468 == 56469` |
+
+核對依據：2026-11-24 實跑。副本裡的 `sources.yml` 換成修好的版本，因為當時專案的那份讀不起來；專案裡的這個測試，寫這則時還沒有實跑過。`to_regclass`、`InFailedSqlTransaction`、參數寫法只對測試庫跑唯讀查詢；`run_shop` 是獨立小例子。7 步的順序取自正式庫 14:30 的 `dbt build` log；「還沒有 mart」和「先用 dbt run 建過一次」那兩行輸出，是 15:21 的存檔在副本跑的。「第一次呼叫換成 `run`」也在副本跑過：沒有 mart 11.06 秒、已經有 mart 9.58 秒，都是 1 passed。
+
+### 2026-11-24：新鮮度檢查的指令：每個字是什麼、怎麼找到那張表
+
+**一句話：** `dbt source freshness --select source:youbike.response` 查 `response` 表最新一筆是多久以前，超過門檻就警告或失敗。`source freshness`、`--select`、`source:` 是 dbt 的固定字；`youbike`、`response` 是自己在 yml 取的名字，dbt 用名字找，不用指名檔案。
+
+問題（Andrew 11/24 依序問）：新鮮度 DAG 照每月 DAG 寫，舉個例；完整的 bash 指令是什麼？`source freshness --select source:youbike.response` 逐句解釋；`source` 不是檔案，是固定的指令嗎？名字定義在 yml 裡，不用指名 yml 就找得到嗎？這條指令在幹嘛？
+
+#### 整條指令在做什麼
+
+```text
+set -a; . <Youbike>/.env; set +a; <Youbike>/.venv-dbt/bin/dbt source freshness --select source:youbike.response --target production --project-dir <Youbike>/dbt --profiles-dir <Youbike>/dbt
+```
+
+| 這一段 | 做什麼 |
+|---|---|
+| `set -a; . …/.env; set +a;` | 載入連線設定，並讓後面啟動的程式（dbt）讀得到 |
+| `…/.venv-dbt/bin/dbt` | 啟動 dbt |
+| `source freshness --select source:youbike.response` | 查那張表最新一筆的時間，和門檻比 |
+| `--target production` | 用 profiles.yml 的哪一組連線（正式庫） |
+| `--project-dir`、`--profiles-dir` | 去哪裡讀專案（yml、SQL）和 profiles.yml |
+
+和每月 DAG 只差第三段（每月是 `test --select tag:monthly`，見第 5 主題 2026-11-24 那則）。
+
+第三段送出的 SQL（咖啡店範例的 log）：
+
+```sql
+select
+  max(loaded_at) as max_loaded_at,
+  now() as snapshotted_at
+from "youbike_test"."demo_cafe_fresh"."orders"
+```
+
+`max(...)` 裡的欄位是 `sources.yml` 的 `loaded_at_field`。dbt 把兩個時間相減，和 `warn_after`、`error_after` 比。咖啡店範例（90 分鐘警告、3 小時失敗）用 `BashOperator` 實跑：
+
+| 最新一筆 | dbt 印出 | task |
+|---|---|---|
+| 80 分鐘前 | `PASS` | success |
+| 2 小時前 | `WARN` | success（結束碼 0，只有 log 看得到警告） |
+| 4 小時前 | `ERROR STALE` | failed（結束碼 1） |
+
+`set -a` 的用途（獨立小例子，`cafe.env` 裡是 `COFFEE=latte`）：
+
+```text
+## . cafe.env
+bash 自己讀到 latte，它啟動的 Python 讀到 None
+## set -a; . cafe.env; set +a
+bash 自己讀到 latte，它啟動的 Python 讀到 latte
+```
+
+#### `source freshness --select source:youbike.response` 每個字
+
+| 字 | 意思 | 誰決定的 |
+|---|---|---|
+| `source`（第一個） | 對誰做事：來源表，也就是在 yml 登記、但不是 dbt 建的表（`raw_bytes`、`response` 是擷取程式寫進去的） | dbt 固定 |
+| `freshness` | 做什麼事：查最新一筆是什麼時候 | dbt 固定 |
+| `--select` | 只處理後面指定的 | dbt 固定 |
+| `source:`（第二個） | 怎麼找：用來源的名字找。每月 DAG 的 `tag:` 在同一個位置，是用標籤找 | dbt 固定 |
+| `youbike` | 來源的名字，`sources.yml` 的 `- name: youbike` | 自己取 |
+| `.response` | 那個來源底下的哪張表，`- name: response` | 自己取 |
+
+兩個 `source` 同字不同事：第一個是做什麼，第二個是怎麼找。`source` 是指令，不是檔案；`dbt source --help` 的輸出：
+
+```text
+Usage: dbt source [OPTIONS] COMMAND [ARGS]...
+Commands:
+  freshness  check the current freshness of the project's sources
+```
+
+`.response` 有寫和沒寫的差別：
+
+```text
+--select source:youbike            → raw_bytes、response   （整個來源，兩張）
+--select source:youbike.response   → response              （一張）
+```
+
+#### 不用指名 yml：先讀完 models 底下的 yml，再用名字找
+
+1. `--project-dir` 告訴 dbt 專案在哪。
+2. dbt 讀裡面的 `dbt_project.yml`：`model-paths: ["models"]`。
+3. 把 `models/` 底下所有 `.yml`（含子資料夾）讀進來，合成一份名單，裡面有 `youbike.response`。
+4. `--select source:youbike.response` 拿名字去名單裡找，和檔名、放在哪個子資料夾無關。
+
+| yml 放哪裡 | 同一個選擇器的結果 |
+|---|---|
+| `models/staging/abc.yml`（只改檔名） | 找得到 |
+| `models/x/y/z/abc.yml`（搬到更深） | 找得到 |
+| `elsewhere/abc.yml`（`models/` 外面） | 找不到，exit 2 |
+
+最後一種的錯誤：
+
+```text
+Model 'model.youbike.stg_youbike_snapshot' (models/staging/stg_youbike_snapshot.sql)
+depends on a source named 'youbike.response' which was not found
+```
+
+staging 的 `{{source('youbike','response')}}` 是同一個機制，也只寫名字（登記簿見同主題 2026-11-10 `sources.yml` 那則）。固定的是檔案裡 `sources:` 這個字，不是檔名。
+
+#### 為什麼一定要寫 --select
+
+`selectors.yml` 設了預設選擇器，它選不到來源表。沒寫 `--select` 就用預設：什麼都沒查，結束碼還是 0，排程永遠是綠的。咖啡店同一個 task 實跑：
+
+```text
+最新訂單 20 分鐘前，有 --select   → PASS           → task success
+最新訂單 5 小時前， 有 --select   → ERROR STALE    → task failed
+最新訂單 5 小時前， 沒有 --select → Nothing to do  → task success
+```
+
+把每月 DAG 的 `test --select tag:monthly` 改成 `test --select source:monthly` 也永遠是綠的：`dbt test` 跑的是測試，不查新鮮度；`monthly` 是標籤，不是來源的名字。
+
+```text
+The selection criterion 'source:monthly' does not match any enabled nodes
+Nothing to do
+exit 0
+```
+
+#### 範例：咖啡店的新鮮度 DAG
+
+複製每月 DAG，換名字（`dag_id`、`task_id`）、時間（`schedule`）、dbt 動作，其他不動：
+
+```python
+with DAG(
+    dag_id="cafe_freshness_dag",
+    schedule="20 * * * *",
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    catchup=False,
+    max_active_runs=1,
+):
+    BashOperator(
+        task_id="check_orders_fresh",
+        bash_command=(
+            f"{DBT} source freshness --select source:cafe.orders --target shop "
+            f"--project-dir {P} --profiles-dir {P}"
+        ),
+    )
+```
+
+- 例子省略了載入 `.env` 的那段，每月 DAG 有，要留著。
+- 目錄要寫完整路徑（`{youbike_root}/dbt`）：`BashOperator` 在暫存資料夾執行，實際印出的 `pwd` 是 `/private/tmp/airflowtmp…`，所以 `--project-dir dbt` 這種相對路徑找不到。
+
+#### `count` 和 `period`：門檻怎麼寫（2026-11-24 補）
+
+問題（Andrew 11/24 問）：`{count: 1, period: hour}` 的 `count` 是幹嘛的？
+
+`count` 是數字，`period` 是單位，合起來是一段時間。`count` 不是資料筆數，和 SQL 的 `count(*)` 無關。
+
+| 寫法 | 意思 |
+|---|---|
+| `{count: 1, period: hour}` | 1 小時 |
+| `{count: 90, period: minute}` | 90 分鐘 |
+| `{count: 3, period: hour}` | 3 小時 |
+
+- `period` 只收 `minute`、`hour`、`day` 三個字。
+- 專案的門檻是 1.5 小時警告、3 小時失敗（Andrew 11/24 決定），要寫成 `{count: 90, period: minute}` 和 `{count: 3, period: hour}`。
+
+咖啡店範例實跑，`warn_after: {count: 90, period: minute}`、`error_after: {count: 3, period: hour}`：
+
+| 最新一筆 | dbt 印出 | 結束碼 |
+|---|---|---|
+| 80 分鐘前 | `PASS` | 0 |
+| 100 分鐘前 | `WARN` | 0 |
+| 200 分鐘前 | `ERROR STALE` | 1 |
+
+dbt 把這兩個值換成一段時間（`{count: 90, period: minute}` → `timedelta(minutes=90)` → 5400 秒），再和「最新一筆離現在多久」比。要超過才算：剛好 90 分鐘是 PASS，90.1 分鐘才是 WARN。
+
+寫錯會怎樣（咖啡店範例實跑，只換門檻的寫法）：
+
+| 寫法 | 結果 |
+|---|---|
+| `{ period: 90 minute }`（數字和單位都放進 `period`） | 讀檔就失敗，`dbt parse` 結束碼 2：`'90 minute' is not a valid TimePeriod` |
+| `{count: 1.5, period: hour}` | 不報錯，1.5 被當成 1：80 分鐘前的資料就 `WARN`。1.5 小時要寫 90 分鐘 |
+| `warn_after` 少寫 `count`，`error_after` 完整 | 不報錯，警告那一級永遠不觸發：100 分鐘前 `PASS`，200 分鐘前 `ERROR STALE` |
+| 兩級都少寫 `count`，或都少寫 `period` | 不報錯，5 小時前的資料也只印 `Nothing to do`，結束碼 0 |
+
+第一種會直接報錯，後三種不會；最後一種和沒寫 `--select` 一樣，什麼都沒查就成功。
+
+核對依據：2026-11-24 實跑。咖啡店的 task 用 Airflow 的 `BashOperator` 直接執行，沒經過排程器；dbt 只連測試庫，用的 schema 跑完已刪。選到哪些表、改名、搬位置、`source:monthly` 在專案 dbt 的副本跑，用假連線、沒連資料庫。`set -a` 是獨立小例子。專案那條完整指令沒有在正式庫跑過，當時 `sources.yml` 還讀不起來。`count` 和 `period` 那節：表格裡的結果是用 `dbt parse` 和 `dbt source freshness` 在測試庫跑的，schema 跑完已刪；5400 秒和「剛好 90 分鐘」是在 Python 直接用 dbt 自己的類別（`FreshnessThreshold`）算的，不是 dbt 指令跑出來的。
+
+
+### 2026-11-26：氣象來源模型：字串怎麼變數字、記號（-99）怎麼處理、TypeAdapter 在做什麼
+
+**一句話：** 氣象回應的值全是字串；型別寫什麼，pydantic 就轉成什麼。`-99`、`X` 這類記號不是數字，要在轉換之前先換成 `None`，記號本身另外記下來。
+
+問題（Andrew 11/26 依序問）：BeforeValidator 只處理 N/A，數字誰轉？那字串怎麼辦？源頭都是字串嗎？哪些要變 float？TypeAdapter 在幹嘛、為什麼不是放 float？那個函式需要嗎、寫在哪？經緯度為什麼不用？代碼是什麼意思？-99 不就是負數？不轉成 float 不是更糟？-99 為什麼不會被當負數？有意義的記號怎麼保留？欄位變兩倍佔空間值得嗎？能不能跳過、另外記？Optional 碰到 None 是跳過嗎？計算時怎麼處理？要不要用 Enum、值要不要改成 1、2、3？
+
+#### 1. 字串轉數字是 pydantic 做的
+
+- `BeforeValidator(函式)` 在 pydantic 轉型別**之前**先跑。函式只把記號換成 `None`，其他原樣交出去。
+- 接著 pydantic 照型別轉：`Optional[float]` 把 `'12.5'` 轉成 `12.5`；轉不了就報錯（`'abc'` → `float_parsing`）。
+- `strict=True` 會禁止字串轉數字（`float_type`），氣象模型不能開。
+- 11/24 那份回應的 26,288 個值全是字串。YouBike 的數字本來就是數字，所以那邊能開 strict。
+
+```text
+'12.5'  函式交出 '12.5' → pydantic 轉成 12.5
+'-99'   函式交出 None   → 收下 None
+'-3.2'  函式交出 '-3.2' → -3.2（真的負溫度照常保留）
+```
+
+#### 2. 哪些欄位轉什麼
+
+| 變成什麼 | 欄位 | 型別 |
+|---|---|---|
+| 數字，記號變 None | 氣溫、濕度、風速、氣壓、當日降水 | `Annotated[Optional[float], BeforeValidator(...)]` |
+| 數字，沒有記號 | WGS84 經緯度 | `float`（官方文件這兩欄沒有特殊代碼，876 站都轉得過去） |
+| 帶時區的時間 | 觀測時間、官方發布時間 | `AwareDatetime` |
+| 不動 | 站號 | `str`（`int("00123")` → `123`，前面的 0 會不見；很多站號有英文） |
+
+#### 3. class 和 TypeAdapter 的分工
+
+- class（例如 `Weather_Station`）只描述「一站」；每個欄位的型別都寫在 class 裡。
+- TypeAdapter 把同一套規則套到「一整串」：效果等於自己跑 `[Weather_Station.model_validate(d) for d in data]`，再加上清單本身的規則 `Field(min_length=1)`。
+- TypeAdapter 裡放什麼型別就檢查什麼。放 `Optional[float]` 意思會變成「整份回應是一個數字」，要放 `List[Weather_Station]`。
+- `Annotated[型別, 附加規則]` 兩處都會出現：欄位那裡附的是換記號的函式，清單那裡附的是「至少一站」。
+
+```text
+Product.model_validate(data)                      → 報錯 model_type（整串丟給「一件」的 class）
+TypeAdapter(List[Product]).validate_python(data)  → [Product(...), Product(...)]
+```
+
+#### 4. 記號（sentinel value）
+
+官方文件 V1.05 的特殊代碼：
+
+| 記號 | 意思 | 會出現在 |
+|---|---|---|
+| `-99` | 缺值或資料異常 | 五個要素 |
+| `X` | 儀器故障 | 五個要素 |
+| `T` | 雨跡：有下雨，少到量不出來 | 只有降水 |
+| `-98` | 連續 6 小時無降水 | 只有降水 |
+
+11/24 那份只出現 `-99`（每個要素 24–28 站）。`T` 其實是「有下雨」，`-98` 是「最近 6 小時沒下」、不等於「今天都沒下」，要不要當 0 到 D25 再定。
+
+`-99` 能轉成數字，問題是意思錯：
+
+```text
+三站平均：-99 存成數字 → -21.5
+          存成 NULL    → 17.2
+```
+
+函式比對的是字串：`'-99'` 對到記號就換成 `None`，`'-3.2'` 對不上就放行。不能用「小於 0」判斷。
+
+#### 5. Optional 與 NULL 怎麼算
+
+- `Optional[float]` = float 或 None。收到 `None` 是收下，不是跳過；欄位整個不見還是報 `missing`。
+- SQL：`avg`、`max` 跳過 NULL；`count(*)` 數列（3）、`count(欄位)` 數有值的（2）；`NULL + 1` 還是 NULL；`where t > 15` 不含 NULL。
+- Python：`sum([17.8, 16.6, None])` → `TypeError`，要先排除 `None`。
+
+#### 6. 記號的意思怎麼留：最後改成明細表
+
+| 存法 | 一天（876 站 × 24 小時，只算五個要素的欄位） |
+|---|---|
+| 數字＋整份原字串 | 2.26 MB |
+| 數字＋只存記號 | 1.63 MB |
+| 只有數字 | 1.56 MB |
+
+最後定案（Andrew 11/26）：主表的數字遇到記號放 NULL、不存原字串；另開**記號明細表**，一個記號一列（raw_id、站號、觀測時間、要素、記號）；再一張**記號說明表**（記號 → 意思）。11/24 那份會有 130 列明細（876 站裡 37 站帶記號）。同站同小時更新時，明細也要一起改。表名別叫 error，`T`、`-98` 不是錯誤。
+
+#### 7. 用 Enum 寫記號清單
+
+```python
+class PayCode(str, Enum):      # 值是字串，所以繼承 str
+    CARD_DECLINED = "-1"
+    BANK_TIMEOUT = "X"
+```
+
+```text
+PayCode("-1") → PayCode.CARD_DECLINED；.name 'CARD_DECLINED'；.value '-1'
+code: Optional[PayCode] 收到 'abc' → 報錯 enum（官方出新記號會當場發現）
+```
+
+- 值用官方記號，不改成 1、2、3：名字已經負責看得懂；改成數字要多一份對照表（`Renumbered('-1')` → `ValueError`）；raw 和明細才對得上；D23 要求保留來源的記號。
+- Python 3.9 沒有 `StrEnum`，要寫 `class X(str, Enum)`。
+- 同一個值讀兩次：數字欄掛「記號換成 None」，記號欄掛「是記號才留下」，兩個函式都從 Enum 取記號清單。
+
+核對依據：2026-11-26 實跑。Pydantic 2.13.5 範例在 Youbike/.venv（Python 3.9.6）；SQL 範例在 youbike_test 唯讀查詢或臨時表，跑完 rollback；記號與數量來自 11/24 下載的官方回應與官方文件 V1.05；空間數字是臨時表實測。
+
+### 2026-11-26：座標怎麼抓：AliasPath 字串找鍵、數字拿位置；照位置拿 WGS84，再用 coordinate_name 比對名稱
+
+**一句話：** JSON 讀進 Python 就是一層層的 dict 和 list。`AliasPath` 每一格往下走一層：字串在 dict 找鍵，數字在 list 拿位置（從 0 算）。`Coordinates` 是 list，WGS84 在 index 1，所以照位置拿；再用 `coordinate_name: Literal["WGS84"]` 比對那一組的名稱，順序一換就當場報錯。
+
+問題（Andrew 11/26 依序問）：第 17–18 行每站都失敗，該怎麼抓？`AliasPath("GeoInfo", "Coordinates")["StationLongitude"]` 可以嗎？建議怎麼抓？資料有好幾層也能用小 class 嗎？是不是就不需要 AliasPath？第 17–18 行能不能直接改成 `alias=`？能不能透過拆解直接抓，一定要另外寫 function 嗎？`Coordinates` 下面不是 JSON 嗎，這樣抓得到？完整資料格式長怎樣？`1` 是 index 嗎？AliasPath 是數字當 index、字串當階層去比對？`coordinate_name` 是不是多餘？
+
+#### 1. 完整資料格式：哪裡是 dict、哪裡是 list
+
+11/24 那份真實回應，第一站展開（`{ }` 是 dict，`[ ]` 是 list）：
+
+```text
+{                                              dict
+  "cwaopendata": {                             dict
+    "sent": "2026-11-24T19:28:05+08:00",       官方發布時間（第 4 步比新舊用）
+    "dataid": "O-A0001-001",
+    ...（identifier、sender、status、msgType、scope）
+    "dataset": {                               dict
+      "Station": [                             list：876 站
+        {                                      dict：一站（模型讀這一層）
+          "StationName": "崇德",
+          "StationId": "C0TB40",
+          "ObsTime": {"DateTime": "2026-11-24T19:00:00+08:00"},
+          "GeoInfo": {
+            "Coordinates": [                   list：兩組座標
+              {"CoordinateName": "TWD67", "CoordinateFormat": "decimal degrees",
+               "StationLatitude": "24.167948", "StationLongitude": "121.649251"},   ← index 0
+              {"CoordinateName": "WGS84", "CoordinateFormat": "decimal degrees",
+               "StationLatitude": "24.166144", "StationLongitude": "121.657414"}    ← index 1
+            ],
+            "StationAltitude": "8.0", "CountyName": "花蓮縣", "TownName": "秀林鄉", ...
+          },
+          "WeatherElement": {
+            "Weather": "陰", "Now": {"Precipitation": "5.5"},
+            "WindDirection": "268.0", "WindSpeed": "1.7", "AirTemperature": "17.8",
+            "RelativeHumidity": "79", "AirPressure": "1020.7",
+            "GustInfo": {...}, "DailyExtreme": {...}
+          }
+        },
+        …其餘 875 站，格式一樣
+      ]
+    }
+  }
+}
+```
+
+- 整份只有兩個 list：`Station`（876 站）和 `Coordinates`（兩組座標），其他都是 dict。
+- 值全是字串，連數字也是（`"17.8"`、`"79"`）。
+
+#### 2. AliasPath 怎麼往下走
+
+- 每一格照順序往下走一層：**字串**在這層的 dict 找鍵；**數字**在這層的 list 拿位置（index，從 0 算）。格數不限。
+- JSON 讀進來就是 dict 和 list，所以 `Coordinates` 底下抓得到。真實資料第一站一步一步走：
+
+```text
+station               → dict
+["GeoInfo"]           → dict
+["Coordinates"]       → list   兩組座標
+[1]                   → dict   WGS84 那組
+["StationLatitude"]   → str    '24.166144'
+```
+
+- 型別要對上那一層：在 list 上用字串就找不到。原本第 17–18 行 `AliasPath("GeoInfo", "Coordinates", "CoordinateName", "StationLatitude")` 在 list 上找 `"CoordinateName"`，876 站 × 2 欄 = 1,752 個 `missing`。
+- `index 1` 不是網站給的數字：是打開資料看到 WGS84 排第二。
+- `alias=` 只看這一層的鍵（例如 `alias="StationId"`）；要往下走好幾層才用 `AliasPath`（例如 `AliasPath("ObsTime", "DateTime")`）。
+
+#### 3. 行不通的寫法
+
+```text
+AliasPath("GeoInfo", "Coordinates")["StationLongitude"]
+→ TypeError: 'AliasPath' object is not subscriptable（AliasPath 只是路線說明，不是資料）
+
+資料["GeoInfo"]["Coordinates"]["StationLongitude"]
+→ TypeError: list indices must be integers or slices, not str（list 只能用位置取）
+
+第 17 行直接改成 alias="StationLatitude"
+→ missing：站這一層只有 StationName、StationId、ObsTime、GeoInfo、WeatherElement 五個鍵
+```
+
+#### 4. 抓法比較
+
+| 做法 | 要不要另外寫 function | 順序換了 |
+|---|---|---|
+| 只照位置拿 index 1 | 不用 | 默默拿到 TWD67（這站兩組差約 800 公尺），不報錯 |
+| **照位置拿＋`coordinate_name` 比對名稱（採用）** | 不用，三行都是拆解 | 當場報錯 |
+| 整個 list 讀進來，交給小 class，再用 `next()` 挑名字 | 要（property） | 照樣拿對 |
+
+#### 5. 採用的寫法（Andrew 11/26 選，請助理代寫）
+
+```python
+from typing import Annotated,List,Literal,Optional        # 第 1 行加 Literal
+
+class Weather_Station(BaseModel):
+    ...
+    Latitude: float = Field(validation_alias=AliasPath("GeoInfo", "Coordinates", 1, "StationLatitude"))       # 第 17 行
+    Longitude: float = Field(validation_alias=AliasPath("GeoInfo", "Coordinates", 1, "StationLongitude"))     # 第 18 行
+    coordinate_name: Literal["WGS84"] = Field(validation_alias=AliasPath("GeoInfo", "Coordinates", 1, "CoordinateName"))  # 第 19 行
+```
+
+- 站上直接有扁平的 `Latitude`、`Longitude`，形狀跟 YouBike 的模型一樣；但名稱大小寫不同（YouBike 是 `latitude`、`longitude`），照 YouBike 類推寫 `站.latitude` 會 `AttributeError`。
+- 字串 `'24.166144'` 變成數字，是因為欄位寫 `float`。
+
+#### 6. coordinate_name 的用法：比對名稱
+
+- `Literal["WGS84"]` 的意思是「這一格只能是 `"WGS84"`」。收到別的字（`"TWD67"`、`"WGS 84"`）就報 `literal_error`。
+- 照位置拿 index 1，靠的是「第二組一定是 WGS84」；第 19 行讀同一個位置的 `CoordinateName` 來比對，確認這件事。
+- 它存下來的值永遠是 `"WGS84"`，工作是檢查，不是存資料；但 `model_dump()` 會帶出這一欄，寫進資料表時要自己挑欄位，或在欄位加 `exclude=True` 讓它不進 dump（待 Andrew 決定）。
+- 真實資料第一站把兩組順序對調後實跑：
+
+```text
+拿掉第 19 行  → 24.167948 121.649251（這是 TWD67 的值，沒報錯）
+有第 19 行    → literal_error ('GeoInfo', 'Coordinates', 1, 'CoordinateName')
+```
+
+- 驗證結果：876 站通過，經緯度和原始資料裡名稱是 WGS84 那組逐站一致；五種壞資料都在驗證時就失敗：兩組順序對調、只剩 TWD67、座標清單是空的、沒有 `Coordinates`、名稱拼成 `"WGS 84"`。
+- 代價：官方哪天換了順序，這種寫法會當場失敗，要改程式；要不要留第 19 行由 Andrew 決定。
+- 已知限制（修完再審找到，待 Andrew 決定）：只檢查 index 1，index 0 不看；兩組都標 WGS84 時會默默取 index 1（官方格式不會這樣，11/24 那份 876 站都是 TWD67、WGS84）。經緯度收得下 `true`（變成 1.0）、`"NaN"`、`"Infinity"`；之後資料表的範圍 CHECK 擋得到 NaN、inf 和超出範圍的值，擋不到 `true`，要不要在 Python 先擋 bool 再決定。
+
+#### 7. 第一版寫法（已換掉）
+
+一開始是「整個 list 讀進來（`List[小 class]`）＋ `wgs84` property 用 `next()` 挑名字」。事後審查找到兩個缺口：少了 WGS84（只剩 TWD67 或清單是空的）也能通過驗證，到取 `.wgs84` 時才出錯；站上沒有扁平的經緯度，`model_dump()` 還會帶出 TWD67。Andrew 問「能不能透過拆解直接抓」，改成第 5 節的寫法，兩個缺口都在驗證時擋下。
+
+核對依據：2026-11-26 實跑。Pydantic 2.13.5、Python 3.9.6（Youbike/.venv）；真實資料是 `Youbike/data/raw/weather/O-A0001-001_20261124_1928.json`（11/24 下載的官方回應）；驗證腳本在助理的 scratchpad，不在專案內。
+
+### 2026-11-26：`List[Weather_Station]` 要不要跟 JSON 完全一樣：多的忽略，少的整份失敗
+
+**一句話：** class 有寫的欄位，JSON 一定要有而且要對；JSON 多出來的欄位直接忽略。清單裡只要有一站少了必填欄位，整份就失敗。
+
+問題（Andrew 11/26）：`List[Weather_Station]` 這一步，是必須完全符合 `Weather_Station` 的格式嗎？JSON 的欄位看起來比這個 class 多很多。
+
+#### 1. 在檔案的哪裡
+
+- `src/extract/weather_model.py` 有兩處 `List[Weather_Station]`，行為相同：清單裡每一站都用第 13 行的 `Weather_Station` 檢查一次。
+  - 第 33 行 `Weather_Stations`：TypeAdapter，直接收站的清單。
+  - 第 38 行 `stations`：外層模型 `Weather_Response`（第 36 行起）的欄位，從整份回應的 `cwaopendata → dataset → Station` 讀進來。
+- 第 14 行 `model_config = ConfigDict()` 沒有設定 `extra`，用的是預設的「忽略多的」。
+
+#### 2. 規則
+
+| JSON 的情況 | 結果 |
+|---|---|
+| 多了 class 沒寫的欄位（`StationName`、`CountyName`、`Weather`、`GustInfo`、`DailyExtreme`…） | 忽略，不報錯，也不會出現在讀出來的結果（`model_dump()`）裡 |
+| 少了 class 有寫的欄位（例如某站沒有 `AirPressure`） | 報錯 `missing`，而且整份失敗，不是只跳過那一站 |
+
+#### 3. 最小例子（菜單）
+
+```python
+class Dish(BaseModel):
+    name: str
+
+TypeAdapter(List[Dish]).validate_python([{"name": "湯", "price": 60, "spicy": False}, {"name": "飯", "price": 20}])
+```
+
+```text
+多出 price、spicy        → [Dish(name='湯'), Dish(name='飯')]，結果裡只有 name
+第二道少了 name          → missing (1, 'name')：第 1 號那道少了 name，整串失敗
+改成 extra='forbid'      → extra_forbidden (0, 'price')：多一個欄位就報錯
+```
+
+#### 4. 為什麼不改成 `extra='forbid'`
+
+官方哪天多加一個我們用不到的欄位，整份就會失敗。我們只在乎用到的欄位在不在、對不對。
+
+#### 5. 真實資料
+
+11/26 18:38 發布的那份（測試庫 `weather` 表 `id` 1）每站都有一堆 class 沒寫的欄位，876 站仍然全部通過。
+
+核對依據：2026-11-26 實跑。Pydantic 2.13.5、Python 3.9.6（Youbike/.venv）；菜單例子在 .venv 單次執行；行號是當天 19:11 的存檔。
+
+### 2026-11-26：`id`、`raw_id` 和「站號＋觀測時間」：誰回答哪一列、誰回答來自哪一份；一對多
+
+**一句話：** 觀測表裡，「站號＋觀測時間」回答「這是哪一列」，`raw_id` 回答「這列來自哪一份 raw」。原本的流水號 `id` 跟「站號＋觀測時間」重複，拿掉；`raw_id` 和 `id` 不重複，留著。`weather` 一列對觀測表很多列，是一對多。
+
+問題（Andrew 11/26）：`id` 和 `raw_id` 是不是重複了？可以把 `raw_id` 改名 `id`、原本的 `id` 拿掉嗎？所以每一個 weather 的 id 等於一個 `raw_id`？你說一對多，但例子看起來是一對一。
+
+#### 1. 三個東西各回答什麼
+
+| 欄位 | 回答什麼 | 一份 raw 有幾個值 |
+|---|---|---|
+| 原本的流水號 `id` | 這一列是哪一列 | 876 個，每列不同 |
+| 站號＋觀測時間 | 這一列是哪一列 | 876 種，每列不同 |
+| `raw_id` | 這一列來自哪一份 raw | 1 個，876 列都一樣 |
+
+前兩個回答同一件事，所以拿掉流水號 `id`，主鍵改成 `PRIMARY KEY(station_id, observe_time)`。`raw_id` 回答的是另一件事，拿掉就查不到一列是從哪一次抓來的。
+
+#### 2. 一對多：直接看兩張表有幾列
+
+在測試庫存兩份 raw（19 點、20 點各一份），兩張表裡面是這樣：
+
+```text
+weather（2 列）
+id | 抓的時間
+1  | 19:05
+2  | 20:05
+
+weather_observation（1,752 列）
+raw_id | station_id | 觀測時間
+1      | C0TB40     | 19:00
+1      | C0SD20     | 19:00
+…        （raw_id = 1 一共 876 列）
+2      | C0TB40     | 20:00
+…        （raw_id = 2 一共 876 列）
+```
+
+`weather` 裡 `id = 1` 只有 1 列；觀測表裡 `raw_id = 1` 有 876 列。左邊一列對右邊 876 列，所以是一對多。`raw_id` 存的就是 `weather.id` 的號碼，只是換個名字，看得出它是指回 raw。
+
+**YouBike 一樣：** `raw_bytes` 一個 `batch_id` 是 1 列，`response` 裡同一個 `batch_id` 有 1,826 列。`raw_id` 就是氣象版的 `batch_id`。
+
+#### 3. 為什麼不把 `raw_id` 改名成 `id`
+
+資料庫不會擋，但名字會騙人：看到 `id` 會以為一列一個號碼，實際上 876 列共用同一個值。查詢寫成 `weather.id = weather_observation.id`，看起來像一對一，其實是一份 raw 對 876 列。Andrew 11/26 照建議：拿掉流水號 `id`，`raw_id` 名字留著。
+
+#### 4. 例外
+
+第 4 步「官方發布時間較新的才蓋過去」時，被更新的那列，`raw_id` 會換成較新那份的號碼。所以一份 raw 之後不一定還對到 876 列。
+
+核對依據：2026-11-26 實跑。測試庫一個用完就收回的 schema，用 `sql/practice/weather.sql`（當天 19:3x 版）建表，把 11/24 的真實回應存兩份、各寫進 876 列查回；Python 3.9.6、psycopg（Youbike/.venv）。
+
+### 2026-11-26：`ON CONFLICT` ＋ `excluded`：撞到已經有的列時怎麼辦
+
+**一句話：** `ON CONFLICT (鍵)` 決定「要寫的這一列，鍵跟表裡已經有的撞到時怎麼辦」；`excluded` 是「這次想寫、被擋下來的那一列」。`DO NOTHING` 跳過；`DO UPDATE SET 欄 = excluded.欄` 用新的蓋過去；後面再加 `WHERE`，決定什麼情況才蓋。
+
+問題（Andrew 11/26）：第 4 步「載入」的第 2、3 件看不懂，接著要把 `on conflict`＋`excluded` 的用法寫進筆記。
+
+#### 1. 為什麼氣象需要它
+
+同一個整點的觀測，官方大約每 10 分鐘重發一次（例如 19:08、19:18 兩份都是 19:00 的觀測）。所以同一站、同一個觀測時間，會一直被載入很多次。YouBike 的載入（`youbike.py` 第 38–50 行）是先 `SELECT` 查出已經有的列，在 Python 裡比對：一樣就跳過、不一樣就報錯。氣象改成一句 `INSERT` 就處理完。
+
+#### 2. 每一段的意思
+
+| 寫法 | 意思 |
+|---|---|
+| `INSERT INTO 表 (...) VALUES (...)` | 照常寫一列 |
+| `ON CONFLICT (站號, 觀測時間)` | 如果這兩欄跟表裡某一列一樣（撞到主鍵或 UNIQUE） |
+| `DO NOTHING` | 這一列就不寫，也不報錯 |
+| `DO UPDATE SET 氣溫 = excluded.氣溫, ...` | 把表裡那一列，改成這次想寫的值 |
+| `excluded.欄位` | 這次想寫、被擋下來的那一列的值 |
+| `表名.欄位`（例如 `weather_observation.publish_time`） | 表裡原本那一列的值 |
+| `WHERE excluded.publish_time > weather_observation.publish_time` | 只有這次的比較新才蓋；條件不成立就跟 `DO NOTHING` 一樣 |
+
+`ON CONFLICT` 括號裡的欄位，一定要剛好是主鍵或某個 UNIQUE。對不上會直接報錯。
+
+#### 3. 最小例子（書價，實跑）
+
+```sql
+create temp table book_price(isbn text, day date, price numeric, primary key (isbn, day));
+
+insert into book_price values ('A', '2026-01-02', 100)
+on conflict (isbn, day) do nothing;
+
+insert into book_price values ('A', '2026-01-02', 120)
+on conflict (isbn, day) do update set price = excluded.price
+where book_price.price is distinct from excluded.price;
+```
+
+```text
+第一次寫                    → rowcount 1，表裡 100
+同樣再寫一次（do nothing）   → rowcount 0，表裡 100
+價格變 120（do nothing）     → rowcount 0，表裡還是 100
+價格變 120（do update）      → rowcount 1，表裡變 120
+價格沒變（do update＋where） → rowcount 0，沒有動
+```
+
+**只讓比較新的蓋過去**（一個 isbn 一列，多一欄公告時間）：
+
+```sql
+insert into book_price values ('A', 120, '2026-01-02 11:00+08')
+on conflict (isbn) do update set price = excluded.price, announced_at = excluded.announced_at
+where excluded.announced_at > book_price.announced_at;
+```
+
+```text
+10:00 公告 100       → rowcount 1，表裡 100
+11:00 公告 120       → rowcount 1，表裡 120
+重播 10:00 那份       → rowcount 0，表裡還是 120
+同一份 11:00 再來     → rowcount 0，表裡還是 120
+不寫 where、重播 10:00 → 表裡變回 100（舊的蓋掉新的）
+```
+
+#### 4. 兩個坑
+
+```text
+ON CONFLICT 的欄位沒有 UNIQUE／主鍵
+→ there is no unique or exclusion constraint matching the ON CONFLICT specification
+
+更新時沒寫 loaded_at → 價格變了，loaded_at 沒變
+（default now() 只在新增時跑，DO UPDATE 要自己寫 loaded_at = now()）
+```
+
+#### 5. 對到氣象
+
+以 C0TB40 19:00 那列為例（19:18 的 21.1 是假設的值）：
+
+| 載入哪一份 | 表裡已經有這一列嗎 | 結果 | 表裡變成 |
+|---|---|---|---|
+| 19:08 發布 | 沒有 | 新增 | 21.3（19:08） |
+| 19:18 發布 | 有，19:18 比 19:08 新 | `DO UPDATE` 蓋過去 | 21.1（19:18） |
+| 19:08 那份再載一次 | 有，19:08 沒比 19:18 新 | `WHERE` 不成立，不動 | 21.1（19:18） |
+
+氣象這句的 `ON CONFLICT` 用 `(station_id, observe_time)`，也就是 `weather_observation` 的主鍵。蓋過去時，數值、代碼、`publish_time`、`raw_id` 都換成新的，`ingested_at` 要自己寫 `now()`。
+
+核對依據：書價例子 2026-11-24、11-26 在測試庫臨時表實跑（PostgreSQL 16.13、psycopg、Youbike/.venv）；21.3 是 11/26 19:08 那份真實回應裡 C0TB40 的氣溫，21.1 是為了說明假設的值。
