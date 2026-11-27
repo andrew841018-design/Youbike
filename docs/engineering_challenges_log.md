@@ -4480,3 +4480,80 @@ ON CONFLICT 的欄位沒有 UNIQUE／主鍵
 氣象這句的 `ON CONFLICT` 用 `(station_id, observe_time)`，也就是 `weather_observation` 的主鍵。蓋過去時，數值、代碼、`publish_time`、`raw_id` 都換成新的，`ingested_at` 要自己寫 `now()`。
 
 核對依據：書價例子 2026-11-24、11-26 在測試庫臨時表實跑（PostgreSQL 16.13、psycopg、Youbike/.venv）；21.3 是 11/26 19:08 那份真實回應裡 C0TB40 的氣溫，21.1 是為了說明假設的值。
+
+### 2026-11-27：fixture 的 scope：預設（每個測試一次）和 `scope="module"`（整個檔一次）
+
+**一句話：** 沒寫 `scope` 的 fixture 是 function：每個測試都重新做一次、測完就收。`scope="module"` 是整個測試檔只做一次，所有測試共用同一份，整個檔跑完才收。
+
+問題（Andrew 11/27）：`scope=module` 和一般的 fixture 差在哪？
+
+#### 1. 在你的檔案的哪裡
+
+- `tests/unit/test_weather_load.py` 第 12–14 行 `weather_body`：`scope="module"`，整個檔只呼叫一次 `extract_weather()`，四個測試共用抓回來的 bytes。
+- `tests/conftest.py` 第 14 行 `test_conn`：沒寫 scope，就是 function。每個測試拿到自己的連線，測完 `rollback`，前一個測試寫的東西不會留給下一個。
+
+#### 2. 差在哪
+
+| | 預設（function） | `scope="module"` |
+|---|---|---|
+| 做幾次 | 每個測試一次 | 整個檔一次 |
+| `yield` 後面（收尾）什麼時候跑 | 每個測試結束就跑 | 整個檔的測試都跑完才跑 |
+| 幾個測試拿到的是不是同一個東西 | 不是，每個測試各一份 | 是，大家共用同一份 |
+| 適合放 | 會被改的、要每次乾淨的（連線、交易） | 做一次很花時間、又不會被改的（下載回來的資料） |
+
+#### 3. 最小例子（咖啡店，實跑）
+
+```python
+@pytest.fixture                      # 沒寫 scope：預設 function
+def cup():
+    log.append("開一個杯子")
+    yield "杯子"
+    log.append("收杯子")
+
+@pytest.fixture(scope="module")      # 整個檔一次
+def coffee_beans():
+    log.append("磨一次豆子")
+    yield "豆子"
+    log.append("倒掉豆子")
+
+def test_a(cup, coffee_beans): ...
+def test_b(cup, coffee_beans): ...
+def test_c(cup, coffee_beans): ...
+```
+
+```text
+磨一次豆子 → 開一個杯子 → test_a → 收杯子 → 開一個杯子 → test_b → 收杯子
+→ 開一個杯子 → test_c → 收杯子 → 倒掉豆子
+```
+
+豆子只磨一次，最後才倒；杯子三個測試各開一次、各收一次。
+
+#### 4. 兩個坑
+
+**共用的東西如果會被改，前面的測試會影響後面的。**
+
+```text
+module fixture 回傳 list ["拿鐵"]，test_1 append("美式")
+→ test_2 看到 ['拿鐵', '美式']（被 test_1 改過了）
+module fixture 回傳 bytes，每個測試自己 json.loads 一份再改
+→ test_2 看到 ['拿鐵']（沒被影響）
+```
+
+所以 `weather_body` 回傳 bytes，每個測試自己 `json.loads(weather_body)` 拿一份 dict 來改，測試 3、4 改副本也不會影響別的測試。
+
+**module 的 fixture 不能用 function 的 fixture。**
+
+```text
+ScopeMismatch: You tried to access the function scoped fixture conn with a module scoped request object.
+```
+
+整個檔只做一次的東西，不能依賴「每個測試都會換掉」的東西。所以 `weather_body` 只負責下載，不碰 `test_conn`；存 raw、載入都寫在測試裡，用各自的 `test_conn`。
+
+#### 5. 為什麼氣象測試這樣分
+
+| fixture | scope | 為什麼 |
+|---|---|---|
+| `weather_body` | module | 下載一次約 1.36 MB；四個測試要的都是同一份，抓四次只是變慢，官方也多被打三次 |
+| `test_conn` | function | 每個測試要有自己的交易，測完收回；共用的話，測試 2 存的列會留給測試 3，結果互相干擾 |
+
+核對依據：2026-11-27 實跑。pytest（Youbike/.venv，Python 3.9.6），咖啡店三個例子在 scratchpad 單次執行；行號是當天 12:16 的 `test_weather_load.py` 與 11/10 的 `conftest.py`。

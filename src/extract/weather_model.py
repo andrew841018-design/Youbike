@@ -1,7 +1,6 @@
 from typing import Annotated,List,Literal,Optional
 from pydantic import BaseModel,ConfigDict,Field,TypeAdapter,AliasPath,BeforeValidator,AwareDatetime
-from src.extract.weather_code import weather_error_code
-codes={w.value for w in weather_error_code}
+from src.extract.weather_code import weather_error_code,codes
 def transform_invalid_code(code):
     if code in codes:
         return None

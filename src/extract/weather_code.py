@@ -4,3 +4,4 @@ class weather_error_code(str,enum.Enum):
     equipment_failure = "X"
     no_precip_for_6h = "-98"
     trace_rain = "T"
+codes={w.value for w in weather_error_code}
